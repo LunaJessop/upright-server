@@ -2,7 +2,7 @@ import "dotenv/config";
 import cors from "cors";
 import express from "express";
 import pg from "pg";
-import { getItems } from "./api-functions/items.js";
+import { createItem, deleteItem, getItemById, getItems, updateItem } from "./api-functions/items.js";
 
 const { Pool } = pg;
 
@@ -25,6 +25,10 @@ app.use(cors());
 app.use(express.json());
 
 app.get("/api/items", getItems);
+app.get("/api/items/:id", getItemById);
+app.post("/api/items", createItem);
+app.put("/api/items/:id", updateItem);
+app.delete("/api/items/:id", deleteItem);
 
 app.get("/api/health", async (req, res) => {
   try {
