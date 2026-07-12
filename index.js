@@ -3,6 +3,8 @@ import cors from "cors";
 import express from "express";
 import pg from "pg";
 import { createItem, deleteItem, getItemById, getItems, updateItem } from "./api-functions/items.js";
+import { getMe, login } from "./api-functions/auth.js";
+import { requireAuth } from "./lib/auth.js";
 
 const { Pool } = pg;
 
@@ -24,11 +26,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.get("/api/items", getItems);
-app.get("/api/items/:id", getItemById);
-app.post("/api/items", createItem);
-app.put("/api/items/:id", updateItem);
-app.delete("/api/items/:id", deleteItem);
+app.post("/api/auth/login", login);
+app.get("/api/auth/me", requireAuth, getMe);
+
+app.get("/api/items", requireAuth, getItems);
+app.get("/api/items/:id", requireAuth, getItemById);
+app.post("/api/items", requireAuth, createItem);
+app.put("/api/items/:id", requireAuth, updateItem);
+app.delete("/api/items/:id", requireAuth, deleteItem);
 
 app.get("/api/health", async (req, res) => {
   try {
