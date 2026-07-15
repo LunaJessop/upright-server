@@ -1,7 +1,10 @@
-import { pool } from "../index.js";
+import { pool } from "../lib/db.js";
+import { expandProductionTree, isMakeItem as isMake } from "../lib/productionTree.js";
+import { resolveVendorId } from "./vendors.js";
 
 const itemsSelect = `
   SELECT i.*,
+    v.name AS vendor_name,
     COALESCE(
       (SELECT json_agg(json_build_object(
         'component_item_id', b.component_item_id,
@@ -19,28 +22,130 @@ const itemsSelect = `
         ORDER BY s.created_at DESC)
        FROM item_skus s WHERE s.item_id = i.id),
       '[]'::json
-    ) AS item_skus
+    ) AS item_skus,
+    COALESCE(
+      (SELECT json_agg(json_build_object(
+        'id', p.id,
+        'sequence', p.sequence,
+        'name', p.name,
+        'description', p.description,
+        'estimated_minutes', p.estimated_minutes)
+        ORDER BY p.sequence)
+       FROM item_router_phases p
+       JOIN item_routers r ON r.id = p.router_id
+       WHERE r.item_id = i.id),
+      '[]'::json
+    ) AS router_phases
   FROM items i
+  LEFT JOIN vendors v ON v.id = i.vendor
 `;
 
+function isMakeItem(makeOrBuy) {
+  return isMake(makeOrBuy);
+}
+
 function normalizeVendorSku(makeOrBuy, sku) {
-  const isMake =
-    makeOrBuy === "make" || makeOrBuy === true || makeOrBuy === "true";
+  const isMake = isMakeItem(makeOrBuy);
   if (isMake) return null;
   const trimmed = sku == null ? "" : String(sku).trim();
   return trimmed === "" ? null : trimmed;
 }
 
-function validateItemPayload({ name, sku, make_or_buy }) {
+function validateItemPayload({ name, sku, make_or_buy, router_phases }) {
   if (!name?.trim()) {
     return "name is required";
   }
-  const isMake =
-    make_or_buy === "make" || make_or_buy === true || make_or_buy === "true";
+  const isMake = isMakeItem(make_or_buy);
   if (!isMake && !normalizeVendorSku(make_or_buy, sku)) {
     return "Vendor part number is required for buy items";
   }
+  if (!isMake && Array.isArray(router_phases) && router_phases.length > 0) {
+    return "Router phases are only allowed for make items";
+  }
+  if (isMake && Array.isArray(router_phases) && router_phases.length > 0) {
+    for (let i = 0; i < router_phases.length; i++) {
+      const phase = router_phases[i];
+      if (!phase.name?.trim()) {
+        return `Phase ${i + 1} requires a name`;
+      }
+      const seq = Number(phase.sequence);
+      if (seq !== i + 1) {
+        return "Phase sequence must be 1, 2, 3… with no gaps";
+      }
+    }
+  }
   return null;
+}
+
+async function detachBatchPhasesFromItemRouter(dbClient, itemId) {
+  await dbClient.query(
+    `UPDATE batch_phases bp
+     SET source_phase_id = NULL
+     WHERE source_phase_id IN (
+       SELECT p.id
+       FROM item_router_phases p
+       JOIN item_routers r ON r.id = p.router_id
+       WHERE r.item_id = $1
+     )`,
+    [itemId]
+  );
+}
+
+async function replaceRouterPhases(dbClient, clientId, itemId, routerPhases) {
+  if (!Array.isArray(routerPhases) || routerPhases.length === 0) {
+    await detachBatchPhasesFromItemRouter(dbClient, itemId);
+    await dbClient.query("DELETE FROM item_routers WHERE item_id = $1", [itemId]);
+    return [];
+  }
+
+  const existing = await dbClient.query(
+    "SELECT id FROM item_routers WHERE item_id = $1",
+    [itemId]
+  );
+
+  let routerId;
+  if (existing.rows.length > 0) {
+    routerId = existing.rows[0].id;
+    // Batches snapshot phases and keep source_phase_id; clear before rebuild.
+    await detachBatchPhasesFromItemRouter(dbClient, itemId);
+    await dbClient.query("DELETE FROM item_router_phases WHERE router_id = $1", [
+      routerId,
+    ]);
+  } else {
+    const { rows } = await dbClient.query(
+      `INSERT INTO item_routers (client_id, item_id)
+       VALUES ($1, $2) RETURNING id`,
+      [clientId, itemId]
+    );
+    routerId = rows[0].id;
+  }
+
+  const inserted = [];
+  for (const phase of routerPhases) {
+    const { rows } = await dbClient.query(
+      `INSERT INTO item_router_phases
+         (router_id, sequence, name, description, estimated_minutes)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, sequence, name, description, estimated_minutes`,
+      [
+        routerId,
+        phase.sequence,
+        phase.name.trim(),
+        phase.description?.trim() || null,
+        phase.estimated_minutes == null || phase.estimated_minutes === ""
+          ? null
+          : Number(phase.estimated_minutes),
+      ]
+    );
+    inserted.push(rows[0]);
+  }
+
+  return inserted;
+}
+
+async function clearItemRouter(dbClient, itemId) {
+  await detachBatchPhasesFromItemRouter(dbClient, itemId);
+  await dbClient.query("DELETE FROM item_routers WHERE item_id = $1", [itemId]);
 }
 
 async function assertBomComponentsBelongToClient(dbClient, clientId, bomItems) {
@@ -106,6 +211,35 @@ export async function getItemById(req, res) {
   }
 }
 
+export async function getItemProductionTree(req, res) {
+  const { id } = req.params;
+  const { clientId } = req.auth;
+  const quantity = Number(req.query.quantity ?? 1);
+
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    return res.status(400).json({ error: "quantity must be greater than zero" });
+  }
+
+  const dbClient = await pool.connect();
+  try {
+    const tree = await expandProductionTree(
+      dbClient,
+      clientId,
+      Number(id),
+      quantity
+    );
+    res.json(tree);
+  } catch (err) {
+    console.error(err);
+    if (err.status === 404) {
+      return res.status(404).json({ error: err.message });
+    }
+    res.status(500).json({ error: "Failed to expand production tree" });
+  } finally {
+    dbClient.release();
+  }
+}
+
 export async function createItem(req, res) {
   const {
     name,
@@ -117,9 +251,15 @@ export async function createItem(req, res) {
     active,
     vendor,
     bom_items = [],
+    router_phases = [],
   } = req.body;
 
-  const validationError = validateItemPayload({ name, sku, make_or_buy });
+  const validationError = validateItemPayload({
+    name,
+    sku,
+    make_or_buy,
+    router_phases,
+  });
   if (validationError) {
     return res.status(400).json({ error: validationError });
   }
@@ -129,6 +269,10 @@ export async function createItem(req, res) {
   const dbClient = await pool.connect();
   try {
     await dbClient.query("BEGIN");
+
+    const resolvedVendor = isMakeItem(make_or_buy)
+      ? null
+      : await resolveVendorId(dbClient, clientId, vendor);
 
     const { rows } = await dbClient.query(
       `INSERT INTO items
@@ -145,7 +289,7 @@ export async function createItem(req, res) {
         unit_of_measure ?? "",
         default_unit_price === "" ? null : default_unit_price,
         active ?? true,
-        vendor === "" ? null : vendor,
+        resolvedVendor,
         userId,
       ]
     );
@@ -161,8 +305,17 @@ export async function createItem(req, res) {
       );
     }
 
+    const savedPhases = isMakeItem(make_or_buy)
+      ? await replaceRouterPhases(dbClient, clientId, item.id, router_phases)
+      : await clearItemRouter(dbClient, item.id).then(() => []);
+
     await dbClient.query("COMMIT");
-    res.status(201).json({ ...item, bom_items, item_skus: [] });
+    res.status(201).json({
+      ...item,
+      bom_items,
+      item_skus: [],
+      router_phases: savedPhases,
+    });
   } catch (err) {
     await dbClient.query("ROLLBACK");
     console.error(err);
@@ -190,9 +343,15 @@ export async function updateItem(req, res) {
     active,
     vendor,
     bom_items = [],
+    router_phases = [],
   } = req.body;
 
-  const validationError = validateItemPayload({ name, sku, make_or_buy });
+  const validationError = validateItemPayload({
+    name,
+    sku,
+    make_or_buy,
+    router_phases,
+  });
   if (validationError) {
     return res.status(400).json({ error: validationError });
   }
@@ -202,6 +361,10 @@ export async function updateItem(req, res) {
   const dbClient = await pool.connect();
   try {
     await dbClient.query("BEGIN");
+
+    const resolvedVendor = isMakeItem(make_or_buy)
+      ? null
+      : await resolveVendorId(dbClient, clientId, vendor);
 
     const { rows } = await dbClient.query(
       `UPDATE items
@@ -225,7 +388,7 @@ export async function updateItem(req, res) {
         unit_of_measure ?? "",
         default_unit_price === "" ? null : default_unit_price,
         active ?? true,
-        vendor === "" ? null : vendor,
+        resolvedVendor,
         userId,
         id,
         clientId,
@@ -249,6 +412,10 @@ export async function updateItem(req, res) {
       );
     }
 
+    const savedPhases = isMakeItem(make_or_buy)
+      ? await replaceRouterPhases(dbClient, clientId, id, router_phases)
+      : await clearItemRouter(dbClient, id).then(() => []);
+
     await dbClient.query("COMMIT");
 
     const { rows: skuRows } = await pool.query(
@@ -258,7 +425,12 @@ export async function updateItem(req, res) {
       [id, clientId]
     );
 
-    res.json({ ...item, bom_items, item_skus: skuRows });
+    res.json({
+      ...item,
+      bom_items,
+      item_skus: skuRows,
+      router_phases: savedPhases,
+    });
   } catch (err) {
     await dbClient.query("ROLLBACK");
     console.error(err);

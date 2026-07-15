@@ -2,6 +2,7 @@
  * Creates a demo client + founder user for local development.
  * Usage: node scripts/seed-dev-user.js
  * Default login: founder@demo.com / password123
+ * Demo client is marked subscription_status=active (billing bypass).
  */
 import "dotenv/config";
 import bcrypt from "bcryptjs";
@@ -27,6 +28,7 @@ const PASSWORD = "password123";
 
 async function main() {
   const passwordHash = await bcrypt.hash(PASSWORD, 10);
+  let clientId;
 
   const client = await pool.connect();
   try {
@@ -37,14 +39,23 @@ async function main() {
     );
     if (defaultClient.rows.length === 0) {
       const inserted = await client.query(
-        `INSERT INTO clients (name, slug, email, active)
-         VALUES ($1, $2, $3, TRUE)
+        `INSERT INTO clients (name, slug, email, active, subscription_status)
+         VALUES ($1, $2, $3, TRUE, 'active')
          RETURNING id`,
         ["Demo Company", "demo", EMAIL]
       );
       clientId = inserted.rows[0].id;
     } else {
       clientId = defaultClient.rows[0].id;
+      await client.query(
+        `UPDATE clients
+         SET subscription_status = 'active',
+             name = COALESCE(NULLIF(name, ''), 'Demo Company'),
+             slug = COALESCE(slug, 'demo'),
+             email = COALESCE(email, $2)
+         WHERE id = $1`,
+        [clientId, EMAIL]
+      );
     }
 
     await client.query(
@@ -63,6 +74,7 @@ async function main() {
     console.log(`  Client id: ${clientId}`);
     console.log(`  Email:     ${EMAIL}`);
     console.log(`  Password:  ${PASSWORD}`);
+    console.log("  Billing:   subscription_status=active (demo bypass)");
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err);

@@ -1,39 +1,161 @@
 import "dotenv/config";
 import cors from "cors";
 import express from "express";
-import pg from "pg";
-import { createItem, deleteItem, getItemById, getItems, updateItem } from "./api-functions/items.js";
-import { getMe, login } from "./api-functions/auth.js";
+import { createItem, deleteItem, getItemById, getItemProductionTree, getItems, updateItem } from "./api-functions/items.js";
+import { createBatch, getBatchById, getBatches, updateBatchPhase, cancelBatch } from "./api-functions/batches.js";
+import {
+  createRouterPhaseTemplate,
+  deleteRouterPhaseTemplate,
+  getRouterPhaseTemplates,
+  updateRouterPhaseTemplate,
+} from "./api-functions/routerPhases.js";
+import {
+  createVendor,
+  deleteVendor,
+  getVendors,
+  updateVendor,
+} from "./api-functions/vendors.js";
+import {
+  getInventoryList,
+  getItemInventory,
+  updateItemInventory,
+  updateItemInventoryGoal,
+} from "./api-functions/inventory.js";
+import { getMe, login, register } from "./api-functions/auth.js";
+import { createCheckout, createPortal } from "./api-functions/billing.js";
+import { createClientUser, getClient } from "./api-functions/clients.js";
+import { stripeWebhook } from "./api-functions/stripeWebhook.js";
 import { requireAuth } from "./lib/auth.js";
+import {
+  requireActiveSubscription,
+  requireReadableSubscription,
+  requireAdminOrFounder,
+  requireFounder,
+} from "./lib/billing.js";
+import { pool } from "./lib/db.js";
 
-const { Pool } = pg;
-
-const connectionString = process.env.DATABASE_URL?.trim();
-if (!connectionString) {
-  throw new Error(
-    "DATABASE_URL is required. Use Neon's pooled connection string (ends with -pooler).",
-  );
-}
-
-export const pool = new Pool({
-  connectionString,
-  ...(connectionString.includes("neon.tech")
-    ? { ssl: { rejectUnauthorized: true } }
-    : {}),
-});
+export { pool };
 
 const app = express();
 app.use(cors());
+
+// Stripe webhooks need the raw body for signature verification.
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  stripeWebhook
+);
+
 app.use(express.json());
 
 app.post("/api/auth/login", login);
+app.post("/api/auth/register", register);
 app.get("/api/auth/me", requireAuth, getMe);
 
-app.get("/api/items", requireAuth, getItems);
-app.get("/api/items/:id", requireAuth, getItemById);
-app.post("/api/items", requireAuth, createItem);
-app.put("/api/items/:id", requireAuth, updateItem);
-app.delete("/api/items/:id", requireAuth, deleteItem);
+app.post("/api/billing/checkout", requireAuth, requireFounder, createCheckout);
+app.post("/api/billing/portal", requireAuth, requireFounder, createPortal);
+
+app.get("/api/client", requireAuth, requireReadableSubscription, getClient);
+app.post(
+  "/api/client/users",
+  requireAuth,
+  requireActiveSubscription,
+  requireFounder,
+  createClientUser
+);
+
+app.get("/api/items", requireAuth, requireReadableSubscription, getItems);
+app.get(
+  "/api/inventory",
+  requireAuth,
+  requireReadableSubscription,
+  getInventoryList
+);
+app.get(
+  "/api/items/:id/production-tree",
+  requireAuth,
+  requireReadableSubscription,
+  getItemProductionTree
+);
+app.get("/api/items/:id", requireAuth, requireReadableSubscription, getItemById);
+app.get(
+  "/api/items/:id/inventory",
+  requireAuth,
+  requireReadableSubscription,
+  getItemInventory
+);
+app.put(
+  "/api/items/:id/inventory",
+  requireAuth,
+  requireActiveSubscription,
+  updateItemInventory
+);
+app.put(
+  "/api/items/:id/inventory/goal",
+  requireAuth,
+  requireActiveSubscription,
+  requireAdminOrFounder,
+  updateItemInventoryGoal
+);
+app.post("/api/items", requireAuth, requireActiveSubscription, createItem);
+app.put("/api/items/:id", requireAuth, requireActiveSubscription, updateItem);
+app.delete("/api/items/:id", requireAuth, requireActiveSubscription, deleteItem);
+
+app.get("/api/batches", requireAuth, requireReadableSubscription, getBatches);
+app.get(
+  "/api/batches/:id",
+  requireAuth,
+  requireReadableSubscription,
+  getBatchById
+);
+app.post("/api/batches", requireAuth, requireActiveSubscription, createBatch);
+app.post(
+  "/api/batches/:id/cancel",
+  requireAuth,
+  requireActiveSubscription,
+  cancelBatch
+);
+app.patch(
+  "/api/batches/:id/phases/:phaseId",
+  requireAuth,
+  requireActiveSubscription,
+  updateBatchPhase
+);
+
+app.get(
+  "/api/router-phase-templates",
+  requireAuth,
+  requireReadableSubscription,
+  getRouterPhaseTemplates
+);
+app.post(
+  "/api/router-phase-templates",
+  requireAuth,
+  requireActiveSubscription,
+  createRouterPhaseTemplate
+);
+app.put(
+  "/api/router-phase-templates/:id",
+  requireAuth,
+  requireActiveSubscription,
+  updateRouterPhaseTemplate
+);
+app.delete(
+  "/api/router-phase-templates/:id",
+  requireAuth,
+  requireActiveSubscription,
+  deleteRouterPhaseTemplate
+);
+
+app.get("/api/vendors", requireAuth, requireReadableSubscription, getVendors);
+app.post("/api/vendors", requireAuth, requireActiveSubscription, createVendor);
+app.put("/api/vendors/:id", requireAuth, requireActiveSubscription, updateVendor);
+app.delete(
+  "/api/vendors/:id",
+  requireAuth,
+  requireActiveSubscription,
+  deleteVendor
+);
 
 app.get("/api/health", async (req, res) => {
   try {
