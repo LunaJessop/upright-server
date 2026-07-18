@@ -67,16 +67,17 @@ async function syncBatchStatus(dbClient, batchId) {
   );
 
   let batchStatus = "planned";
-  if (allDone) batchStatus = "complete";
-  else if (anyStarted) batchStatus = "in_progress";
+  // All phases done still means floor work finished — batch stays open until
+  // master Complete posts inventory and locks the batch.
+  if (allDone || anyStarted) batchStatus = "in_progress";
 
   await dbClient.query(
     `UPDATE batches
      SET status = $1,
-         end_date = CASE WHEN $1 = 'complete' THEN CURRENT_TIMESTAMP ELSE end_date END,
          start_date = CASE WHEN $1 = 'in_progress' AND start_date IS NULL THEN CURRENT_TIMESTAMP ELSE start_date END,
          updated_at = CURRENT_TIMESTAMP
-     WHERE id = $2`,
+     WHERE id = $2
+       AND status NOT IN ('complete', 'cancelled')`,
     [batchStatus, batchId]
   );
 }
@@ -286,6 +287,9 @@ export async function createBatch(req, res) {
     if (err.status === 404) {
       return res.status(404).json({ error: err.message });
     }
+    if (err.status === 400) {
+      return res.status(400).json({ error: err.message });
+    }
     if (err.code === "23505") {
       return res.status(409).json({ error: "That SKU is already in use" });
     }
@@ -340,6 +344,138 @@ export async function cancelBatch(req, res) {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to cancel batch" });
+  }
+}
+
+async function adjustInventoryQuantity(dbClient, clientId, itemId, delta) {
+  const amount = Number(delta);
+  if (!Number.isFinite(amount) || amount === 0) return;
+
+  await dbClient.query(
+    `INSERT INTO inventory (client_id, item_id, quantity, updated_at)
+     VALUES ($1, $2, GREATEST(0, $3), CURRENT_TIMESTAMP)
+     ON CONFLICT (client_id, item_id)
+     DO UPDATE SET quantity = GREATEST(0, inventory.quantity + $3),
+                   updated_at = CURRENT_TIMESTAMP`,
+    [clientId, itemId, amount]
+  );
+}
+
+/**
+ * Master complete: lock batch, post inventory once.
+ * - Credits finished item by batch.quantity
+ * - Debits buy component allocations (nested make lines are production steps, not stock pulls)
+ */
+export async function completeBatch(req, res) {
+  const { id: batchId } = req.params;
+  const { clientId, userId } = req.auth;
+  const id = Number(batchId);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: "Invalid batch id" });
+  }
+
+  const dbClient = await pool.connect();
+  try {
+    await dbClient.query("BEGIN");
+
+    const { rows: owned } = await dbClient.query(
+      `SELECT id, item_id, quantity, status, inventory_posted
+       FROM batches
+       WHERE id = $1 AND client_id = $2
+       FOR UPDATE`,
+      [id, clientId]
+    );
+    if (owned.length === 0) {
+      await dbClient.query("ROLLBACK");
+      return res.status(404).json({ error: "Batch not found" });
+    }
+
+    const batch = owned[0];
+    if (batch.status === "cancelled") {
+      await dbClient.query("ROLLBACK");
+      return res.status(400).json({ error: "Cancelled batches cannot be completed" });
+    }
+    if (batch.status === "complete" || batch.inventory_posted) {
+      await dbClient.query("ROLLBACK");
+      const { rows } = await pool.query(
+        `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
+        [id, clientId]
+      );
+      return res.json(rows[0]);
+    }
+
+    const { rows: phases } = await dbClient.query(
+      `SELECT status FROM batch_phases WHERE batch_id = $1`,
+      [id]
+    );
+    if (phases.length > 0) {
+      const unfinished = phases.some(
+        (phase) => phase.status !== "complete" && phase.status !== "skipped"
+      );
+      if (unfinished) {
+        await dbClient.query("ROLLBACK");
+        return res.status(400).json({
+          error:
+            "Finish or cancel every phase before completing the batch",
+        });
+      }
+    }
+
+    const qty = Number(batch.quantity);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      await dbClient.query("ROLLBACK");
+      return res.status(400).json({ error: "Batch quantity is invalid" });
+    }
+
+    // Credit finished goods
+    await adjustInventoryQuantity(dbClient, clientId, batch.item_id, qty);
+
+    // Debit purchased materials allocated to this batch
+    const { rows: components } = await dbClient.query(
+      `SELECT bc.item_id, bc.quantity_allocated, i.make_or_buy
+       FROM batch_components bc
+       JOIN items i ON i.id = bc.item_id
+       WHERE bc.batch_id = $1`,
+      [id]
+    );
+
+    for (const component of components) {
+      if (isMakeItem(component.make_or_buy)) continue;
+      const allocated = Number(component.quantity_allocated);
+      if (!Number.isFinite(allocated) || allocated <= 0) continue;
+      await adjustInventoryQuantity(
+        dbClient,
+        clientId,
+        component.item_id,
+        -allocated
+      );
+    }
+
+    await dbClient.query(
+      `UPDATE batches
+       SET status = 'complete',
+           inventory_posted = TRUE,
+           end_date = CURRENT_TIMESTAMP,
+           updated_by = $1,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2 AND client_id = $3`,
+      [userId, id, clientId]
+    );
+
+    await dbClient.query("COMMIT");
+
+    const { rows } = await pool.query(
+      `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
+      [id, clientId]
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    await dbClient.query("ROLLBACK");
+    console.error(err);
+    res.status(500).json({ error: "Failed to complete batch" });
+  } finally {
+    dbClient.release();
   }
 }
 

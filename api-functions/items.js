@@ -1,5 +1,6 @@
 import { pool } from "../lib/db.js";
 import { expandProductionTree, isMakeItem as isMake } from "../lib/productionTree.js";
+import { bomQuantityInStockUnit, unitsAreCompatible } from "../lib/units.js";
 import { resolveVendorId } from "./vendors.js";
 
 const itemsSelect = `
@@ -8,7 +9,8 @@ const itemsSelect = `
     COALESCE(
       (SELECT json_agg(json_build_object(
         'component_item_id', b.component_item_id,
-        'quantity', b.quantity))
+        'quantity', b.quantity,
+        'unit_of_measure', b.unit_of_measure))
        FROM bom_items b WHERE b.parent_item_id = i.id),
       '[]'::json
     ) AS bom_items,
@@ -164,7 +166,9 @@ async function assertBomComponentsBelongToClient(dbClient, clientId, bomItems) {
   }
 
   const { rows } = await dbClient.query(
-    "SELECT id FROM items WHERE client_id = $1 AND id = ANY($2::int[])",
+    `SELECT id, unit_of_measure
+     FROM items
+     WHERE client_id = $1 AND id = ANY($2::int[])`,
     [clientId, componentIds]
   );
 
@@ -172,6 +176,57 @@ async function assertBomComponentsBelongToClient(dbClient, clientId, bomItems) {
     throw Object.assign(
       new Error("BOM components must belong to your company"),
       { status: 400 }
+    );
+  }
+
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  for (const line of bomItems) {
+    const componentId = Number(line.component_item_id);
+    const stockUnit = byId.get(componentId)?.unit_of_measure ?? "";
+    const lineUnit = String(line.unit_of_measure ?? "").trim() || stockUnit;
+    if (lineUnit && stockUnit && !unitsAreCompatible(lineUnit, stockUnit)) {
+      throw Object.assign(
+        new Error(
+          `BOM unit "${lineUnit}" is not compatible with component stock unit "${stockUnit}"`
+        ),
+        { status: 400 }
+      );
+    }
+    const qty = Number(line.quantity);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      throw Object.assign(new Error("BOM quantity must be greater than zero"), {
+        status: 400,
+      });
+    }
+    // Ensure conversion works when units differ
+    if (
+      lineUnit &&
+      stockUnit &&
+      lineUnit !== stockUnit &&
+      bomQuantityInStockUnit(qty, lineUnit, stockUnit) == null
+    ) {
+      throw Object.assign(
+        new Error(`Cannot convert BOM quantity from ${lineUnit} to ${stockUnit}`),
+        { status: 400 }
+      );
+    }
+  }
+}
+
+async function insertBomLines(dbClient, parentItemId, bomItems) {
+  for (const line of bomItems) {
+    const { rows: componentRows } = await dbClient.query(
+      `SELECT unit_of_measure FROM items WHERE id = $1`,
+      [line.component_item_id]
+    );
+    const stockUnit = componentRows[0]?.unit_of_measure ?? "";
+    const lineUnit =
+      String(line.unit_of_measure ?? "").trim() || stockUnit || null;
+
+    await dbClient.query(
+      `INSERT INTO bom_items (parent_item_id, component_item_id, quantity, unit_of_measure)
+       VALUES ($1, $2, $3, $4)`,
+      [parentItemId, line.component_item_id, line.quantity, lineUnit]
     );
   }
 }
@@ -296,14 +351,7 @@ export async function createItem(req, res) {
     const item = rows[0];
 
     await assertBomComponentsBelongToClient(dbClient, clientId, bom_items);
-
-    for (const line of bom_items) {
-      await dbClient.query(
-        `INSERT INTO bom_items (parent_item_id, component_item_id, quantity)
-         VALUES ($1, $2, $3)`,
-        [item.id, line.component_item_id, line.quantity]
-      );
-    }
+    await insertBomLines(dbClient, item.id, bom_items);
 
     const savedPhases = isMakeItem(make_or_buy)
       ? await replaceRouterPhases(dbClient, clientId, item.id, router_phases)
@@ -402,15 +450,8 @@ export async function updateItem(req, res) {
     const item = rows[0];
 
     await assertBomComponentsBelongToClient(dbClient, clientId, bom_items);
-
     await dbClient.query("DELETE FROM bom_items WHERE parent_item_id = $1", [id]);
-    for (const line of bom_items) {
-      await dbClient.query(
-        `INSERT INTO bom_items (parent_item_id, component_item_id, quantity)
-         VALUES ($1, $2, $3)`,
-        [id, line.component_item_id, line.quantity]
-      );
-    }
+    await insertBomLines(dbClient, id, bom_items);
 
     const savedPhases = isMakeItem(make_or_buy)
       ? await replaceRouterPhases(dbClient, clientId, id, router_phases)
