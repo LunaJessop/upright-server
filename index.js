@@ -15,17 +15,24 @@ import {
   getVendors,
   updateVendor,
 } from "./api-functions/vendors.js";
+import { createTag, getTags } from "./api-functions/tags.js";
 import {
   getInventoryList,
   getItemInventory,
   updateItemInventory,
   updateItemInventoryGoal,
 } from "./api-functions/inventory.js";
+import {
+  createPurchaseLot,
+  deletePurchaseLot,
+  getPurchaseLotsForItem,
+} from "./api-functions/purchaseLots.js";
 import { getMe, login, register } from "./api-functions/auth.js";
 import { createCheckout, createPortal } from "./api-functions/billing.js";
 import { createClientUser, getClient } from "./api-functions/clients.js";
+import { listClients } from "./api-functions/admin.js";
 import { stripeWebhook } from "./api-functions/stripeWebhook.js";
-import { requireAuth } from "./lib/auth.js";
+import { requireAuth, requirePlatformAdmin } from "./lib/auth.js";
 import {
   requireActiveSubscription,
   requireReadableSubscription,
@@ -54,6 +61,13 @@ app.get("/api/auth/me", requireAuth, getMe);
 
 app.post("/api/billing/checkout", requireAuth, requireFounder, createCheckout);
 app.post("/api/billing/portal", requireAuth, requireFounder, createPortal);
+
+app.get(
+  "/api/admin/clients",
+  requireAuth,
+  requirePlatformAdmin,
+  listClients
+);
 
 app.get("/api/client", requireAuth, requireReadableSubscription, getClient);
 app.post(
@@ -96,6 +110,24 @@ app.put(
   requireActiveSubscription,
   requireAdminOrFounder,
   updateItemInventoryGoal
+);
+app.get(
+  "/api/items/:id/purchase-lots",
+  requireAuth,
+  requireReadableSubscription,
+  getPurchaseLotsForItem
+);
+app.post(
+  "/api/items/:id/purchase-lots",
+  requireAuth,
+  requireActiveSubscription,
+  createPurchaseLot
+);
+app.delete(
+  "/api/items/:id/purchase-lots/:lotId",
+  requireAuth,
+  requireActiveSubscription,
+  deletePurchaseLot
 );
 app.post("/api/items", requireAuth, requireActiveSubscription, createItem);
 app.put("/api/items/:id", requireAuth, requireActiveSubscription, updateItem);
@@ -162,6 +194,9 @@ app.delete(
   requireActiveSubscription,
   deleteVendor
 );
+
+app.get("/api/tags", requireAuth, requireReadableSubscription, getTags);
+app.post("/api/tags", requireAuth, requireActiveSubscription, createTag);
 
 app.get("/api/health", async (req, res) => {
   try {

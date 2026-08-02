@@ -1,5 +1,6 @@
 import { pool } from "../lib/db.js";
 import { expandProductionTree, isMakeItem } from "../lib/productionTree.js";
+import { computeBatchEconomics } from "../lib/pricing.js";
 
 const batchesSelect = `
   SELECT b.*,
@@ -29,6 +30,8 @@ const batchesSelect = `
         'id', bc.id,
         'item_id', bc.item_id,
         'quantity_allocated', bc.quantity_allocated,
+        'unit_cost_snapshot', bc.unit_cost_snapshot,
+        'line_cost', bc.line_cost,
         'name', ci.name,
         'make_or_buy', ci.make_or_buy,
         'unit_of_measure', ci.unit_of_measure)
@@ -229,7 +232,8 @@ export async function createBatch(req, res) {
     await dbClient.query("BEGIN");
 
     const { rows: itemRows } = await dbClient.query(
-      "SELECT id, make_or_buy FROM items WHERE id = $1 AND client_id = $2",
+      `SELECT id, make_or_buy, unit_sell_price, default_unit_price
+       FROM items WHERE id = $1 AND client_id = $2`,
       [itemId, clientId]
     );
 
@@ -242,6 +246,10 @@ export async function createBatch(req, res) {
       await dbClient.query("ROLLBACK");
       return res.status(400).json({ error: "Batches can only be created for make items" });
     }
+
+    const finishedItem = itemRows[0];
+    const unitSell =
+      finishedItem.unit_sell_price ?? finishedItem.default_unit_price ?? null;
 
     const { rows: batchRows } = await dbClient.query(
       `INSERT INTO batches (client_id, item_id, quantity, sku, status, created_by, updated_by)
@@ -260,13 +268,80 @@ export async function createBatch(req, res) {
 
     await insertPhaseGroups(dbClient, batch.id, phaseGroups);
 
-    for (const need of needs) {
-      await dbClient.query(
-        `INSERT INTO batch_components (batch_id, item_id, quantity_allocated)
-         VALUES ($1, $2, $3)`,
-        [batch.id, need.item_id, need.quantity]
+    const needIds = needs.map((need) => need.item_id);
+    let costByItemId = new Map();
+    if (needIds.length > 0) {
+      const { rows: costRows } = await dbClient.query(
+        `SELECT id, make_or_buy, unit_cost, default_unit_price
+         FROM items
+         WHERE client_id = $1 AND id = ANY($2::int[])`,
+        [clientId, needIds]
+      );
+      costByItemId = new Map(
+        costRows.map((row) => [
+          row.id,
+          {
+            make_or_buy: row.make_or_buy,
+            unit_cost: row.unit_cost ?? row.default_unit_price,
+          },
+        ])
       );
     }
+
+    const needsWithCost = needs.map((need) => {
+      const priced = costByItemId.get(need.item_id);
+      return {
+        ...need,
+        make_or_buy: priced?.make_or_buy ?? need.make_or_buy,
+        unit_cost: priced?.unit_cost ?? null,
+      };
+    });
+
+    const economics = computeBatchEconomics({
+      quantity: qty,
+      unitSellPrice: unitSell,
+      needs: needsWithCost,
+    });
+    const lineByItemId = new Map(
+      economics.lines.map((line) => [line.item_id, line])
+    );
+
+    for (const need of needsWithCost) {
+      const line = lineByItemId.get(need.item_id);
+      await dbClient.query(
+        `INSERT INTO batch_components
+           (batch_id, item_id, quantity_allocated, unit_cost_snapshot, line_cost)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          batch.id,
+          need.item_id,
+          need.quantity,
+          line?.unit_cost_snapshot ?? null,
+          line?.line_cost ?? null,
+        ]
+      );
+    }
+
+    await dbClient.query(
+      `UPDATE batches
+       SET projected_cost = $1,
+           projected_revenue = $2,
+           projected_profit = $3,
+           projected_margin = $4,
+           projected_unit_cost = $5,
+           projected_unit_sell = $6,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $7`,
+      [
+        economics.projected_cost,
+        economics.projected_revenue,
+        economics.projected_profit,
+        economics.projected_margin,
+        economics.projected_unit_cost,
+        economics.projected_unit_sell,
+        batch.id,
+      ]
+    );
 
     await dbClient.query(
       `INSERT INTO item_skus (client_id, item_id, sku, batch_id, source)
@@ -353,9 +428,9 @@ async function adjustInventoryQuantity(dbClient, clientId, itemId, delta) {
 
   await dbClient.query(
     `INSERT INTO inventory (client_id, item_id, quantity, updated_at)
-     VALUES ($1, $2, GREATEST(0, $3), CURRENT_TIMESTAMP)
+     VALUES ($1, $2, GREATEST(0::numeric, $3::numeric), CURRENT_TIMESTAMP)
      ON CONFLICT (client_id, item_id)
-     DO UPDATE SET quantity = GREATEST(0, inventory.quantity + $3),
+     DO UPDATE SET quantity = GREATEST(0::numeric, inventory.quantity + $3::numeric),
                    updated_at = CURRENT_TIMESTAMP`,
     [clientId, itemId, amount]
   );

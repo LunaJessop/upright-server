@@ -1,5 +1,7 @@
 import { pool } from "../lib/db.js";
 import { expandProductionTree, isMakeItem as isMake } from "../lib/productionTree.js";
+import { resolveItemPricing } from "../lib/pricing.js";
+import { syncItemTags } from "../lib/tags.js";
 import { bomQuantityInStockUnit, unitsAreCompatible } from "../lib/units.js";
 import { resolveVendorId } from "./vendors.js";
 
@@ -14,6 +16,28 @@ const itemsSelect = `
        FROM bom_items b WHERE b.parent_item_id = i.id),
       '[]'::json
     ) AS bom_items,
+    COALESCE(
+      (SELECT json_agg(json_build_object(
+        'id', p.id,
+        'name', p.name,
+        'sku', p.sku,
+        'make_or_buy', p.make_or_buy)
+        ORDER BY p.name)
+       FROM bom_items b
+       JOIN items p ON p.id = b.parent_item_id AND p.client_id = i.client_id
+       WHERE b.component_item_id = i.id),
+      '[]'::json
+    ) AS used_in,
+    COALESCE(
+      (SELECT json_agg(json_build_object(
+        'id', t.id,
+        'name', t.name)
+        ORDER BY lower(t.name))
+       FROM item_tags it
+       JOIN tags t ON t.id = it.tag_id
+       WHERE it.item_id = i.id),
+      '[]'::json
+    ) AS tags,
     COALESCE(
       (SELECT json_agg(json_build_object(
         'id', s.id,
@@ -53,14 +77,11 @@ function normalizeVendorSku(makeOrBuy, sku) {
   return trimmed === "" ? null : trimmed;
 }
 
-function validateItemPayload({ name, sku, make_or_buy, router_phases }) {
+function validateItemPayload({ name, make_or_buy, router_phases }) {
   if (!name?.trim()) {
     return "name is required";
   }
   const isMake = isMakeItem(make_or_buy);
-  if (!isMake && !normalizeVendorSku(make_or_buy, sku)) {
-    return "Vendor part number is required for buy items";
-  }
   if (!isMake && Array.isArray(router_phases) && router_phases.length > 0) {
     return "Router phases are only allowed for make items";
   }
@@ -233,10 +254,25 @@ async function insertBomLines(dbClient, parentItemId, bomItems) {
 
 export async function getItems(req, res) {
   const { clientId } = req.auth;
+  const tagIdRaw = req.query?.tag_id;
+  const tagId =
+    tagIdRaw != null && String(tagIdRaw).trim() !== ""
+      ? Number(tagIdRaw)
+      : null;
+
   try {
+    const params = [clientId];
+    let where = "WHERE i.client_id = $1";
+    if (Number.isFinite(tagId)) {
+      params.push(tagId);
+      where += ` AND EXISTS (
+        SELECT 1 FROM item_tags it
+        WHERE it.item_id = i.id AND it.tag_id = $${params.length}
+      )`;
+    }
     const { rows } = await pool.query(
-      `${itemsSelect} WHERE i.client_id = $1 ORDER BY i.id`,
-      [clientId]
+      `${itemsSelect} ${where} ORDER BY i.id`,
+      params
     );
     res.json(rows);
   } catch (err) {
@@ -303,10 +339,13 @@ export async function createItem(req, res) {
     make_or_buy,
     unit_of_measure,
     default_unit_price,
+    unit_cost,
+    unit_sell_price,
     active,
     vendor,
     bom_items = [],
     router_phases = [],
+    tags = [],
   } = req.body;
 
   const validationError = validateItemPayload({
@@ -318,6 +357,12 @@ export async function createItem(req, res) {
   if (validationError) {
     return res.status(400).json({ error: validationError });
   }
+
+  const pricing = resolveItemPricing(make_or_buy, {
+    default_unit_price,
+    unit_cost,
+    unit_sell_price,
+  });
 
   const { clientId, userId } = req.auth;
   const vendorSku = normalizeVendorSku(make_or_buy, sku);
@@ -332,8 +377,9 @@ export async function createItem(req, res) {
     const { rows } = await dbClient.query(
       `INSERT INTO items
          (client_id, name, sku, description, make_or_buy,
-          unit_of_measure, default_unit_price, active, vendor, created_by, updated_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+          unit_of_measure, default_unit_price, unit_cost, unit_sell_price,
+          active, vendor, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
        RETURNING *`,
       [
         clientId,
@@ -342,7 +388,9 @@ export async function createItem(req, res) {
         description ?? "",
         make_or_buy ?? "buy",
         unit_of_measure ?? "",
-        default_unit_price === "" ? null : default_unit_price,
+        pricing.default_unit_price,
+        pricing.unit_cost,
+        pricing.unit_sell_price,
         active ?? true,
         resolvedVendor,
         userId,
@@ -357,12 +405,16 @@ export async function createItem(req, res) {
       ? await replaceRouterPhases(dbClient, clientId, item.id, router_phases)
       : await clearItemRouter(dbClient, item.id).then(() => []);
 
+    const savedTags = await syncItemTags(dbClient, clientId, item.id, tags);
+
     await dbClient.query("COMMIT");
     res.status(201).json({
       ...item,
       bom_items,
       item_skus: [],
       router_phases: savedPhases,
+      tags: savedTags,
+      used_in: [],
     });
   } catch (err) {
     await dbClient.query("ROLLBACK");
@@ -388,10 +440,13 @@ export async function updateItem(req, res) {
     make_or_buy,
     unit_of_measure,
     default_unit_price,
+    unit_cost,
+    unit_sell_price,
     active,
     vendor,
     bom_items = [],
     router_phases = [],
+    tags = [],
   } = req.body;
 
   const validationError = validateItemPayload({
@@ -403,6 +458,12 @@ export async function updateItem(req, res) {
   if (validationError) {
     return res.status(400).json({ error: validationError });
   }
+
+  const pricing = resolveItemPricing(make_or_buy, {
+    default_unit_price,
+    unit_cost,
+    unit_sell_price,
+  });
 
   const { clientId, userId } = req.auth;
   const vendorSku = normalizeVendorSku(make_or_buy, sku);
@@ -422,11 +483,13 @@ export async function updateItem(req, res) {
            make_or_buy = $4,
            unit_of_measure = $5,
            default_unit_price = $6,
-           active = $7,
-           vendor = $8,
-           updated_by = $9,
+           unit_cost = $7,
+           unit_sell_price = $8,
+           active = $9,
+           vendor = $10,
+           updated_by = $11,
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $10 AND client_id = $11
+       WHERE id = $12 AND client_id = $13
        RETURNING *`,
       [
         name.trim(),
@@ -434,7 +497,9 @@ export async function updateItem(req, res) {
         description ?? "",
         make_or_buy ?? "buy",
         unit_of_measure ?? "",
-        default_unit_price === "" ? null : default_unit_price,
+        pricing.default_unit_price,
+        pricing.unit_cost,
+        pricing.unit_sell_price,
         active ?? true,
         resolvedVendor,
         userId,
@@ -447,7 +512,6 @@ export async function updateItem(req, res) {
       await dbClient.query("ROLLBACK");
       return res.status(404).json({ error: "Item not found" });
     }
-    const item = rows[0];
 
     await assertBomComponentsBelongToClient(dbClient, clientId, bom_items);
     await dbClient.query("DELETE FROM bom_items WHERE parent_item_id = $1", [id]);
@@ -457,21 +521,23 @@ export async function updateItem(req, res) {
       ? await replaceRouterPhases(dbClient, clientId, id, router_phases)
       : await clearItemRouter(dbClient, id).then(() => []);
 
+    const savedTags = await syncItemTags(dbClient, clientId, Number(id), tags);
+
     await dbClient.query("COMMIT");
 
-    const { rows: skuRows } = await pool.query(
-      `SELECT id, sku, batch_id, source, created_at
-       FROM item_skus WHERE item_id = $1 AND client_id = $2
-       ORDER BY created_at DESC`,
+    const { rows: fullRows } = await pool.query(
+      `${itemsSelect} WHERE i.id = $1 AND i.client_id = $2`,
       [id, clientId]
     );
 
-    res.json({
-      ...item,
-      bom_items,
-      item_skus: skuRows,
-      router_phases: savedPhases,
-    });
+    res.json(
+      fullRows[0] ?? {
+        ...rows[0],
+        bom_items,
+        router_phases: savedPhases,
+        tags: savedTags,
+      }
+    );
   } catch (err) {
     await dbClient.query("ROLLBACK");
     console.error(err);
