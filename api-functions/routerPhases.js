@@ -1,4 +1,5 @@
 import { pool } from "../lib/db.js";
+import { parseEstimatedMinutes } from "../lib/estimatedMinutes.js";
 
 export async function getRouterPhaseTemplates(req, res) {
   const { clientId } = req.auth;
@@ -26,12 +27,9 @@ export async function createRouterPhaseTemplate(req, res) {
     return res.status(400).json({ error: "Phase name is required" });
   }
 
-  const minutes =
-    estimated_minutes == null || estimated_minutes === ""
-      ? null
-      : Number(estimated_minutes);
-  if (minutes != null && (!Number.isFinite(minutes) || minutes < 0)) {
-    return res.status(400).json({ error: "Estimated minutes must be a non-negative number" });
+  const parsedMinutes = parseEstimatedMinutes(estimated_minutes);
+  if (!parsedMinutes.ok) {
+    return res.status(400).json({ error: parsedMinutes.error });
   }
 
   try {
@@ -40,7 +38,7 @@ export async function createRouterPhaseTemplate(req, res) {
          (client_id, name, description, estimated_minutes)
        VALUES ($1, $2, $3, $4)
        RETURNING id, name, description, estimated_minutes, created_at, updated_at`,
-      [clientId, trimmedName, description?.trim() || null, minutes]
+      [clientId, trimmedName, description?.trim() || null, parsedMinutes.minutes]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -62,12 +60,9 @@ export async function updateRouterPhaseTemplate(req, res) {
     return res.status(400).json({ error: "Phase name is required" });
   }
 
-  const minutes =
-    estimated_minutes == null || estimated_minutes === ""
-      ? null
-      : Number(estimated_minutes);
-  if (minutes != null && (!Number.isFinite(minutes) || minutes < 0)) {
-    return res.status(400).json({ error: "Estimated minutes must be a non-negative number" });
+  const parsedMinutes = parseEstimatedMinutes(estimated_minutes);
+  if (!parsedMinutes.ok) {
+    return res.status(400).json({ error: parsedMinutes.error });
   }
 
   try {
@@ -79,7 +74,7 @@ export async function updateRouterPhaseTemplate(req, res) {
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $4 AND client_id = $5
        RETURNING id, name, description, estimated_minutes, created_at, updated_at`,
-      [trimmedName, description?.trim() || null, minutes, id, clientId]
+      [trimmedName, description?.trim() || null, parsedMinutes.minutes, id, clientId]
     );
 
     if (rows.length === 0) {
@@ -123,10 +118,24 @@ export async function deleteRouterPhaseTemplate(req, res) {
 export async function upsertClientPhaseTemplates(dbClient, clientId, routerPhases) {
   if (!Array.isArray(routerPhases) || routerPhases.length === 0) return;
 
+  const rowsToWrite = [];
   for (const phase of routerPhases) {
     const name = phase.name?.trim();
     if (!name) continue;
 
+    const parsedMinutes = parseEstimatedMinutes(phase.estimated_minutes);
+    if (!parsedMinutes.ok) {
+      throw Object.assign(new Error(parsedMinutes.error), { status: 400 });
+    }
+
+    rowsToWrite.push({
+      name,
+      description: phase.description?.trim() || null,
+      minutes: parsedMinutes.minutes,
+    });
+  }
+
+  for (const row of rowsToWrite) {
     await dbClient.query(
       `INSERT INTO client_router_phase_templates
          (client_id, name, description, estimated_minutes)
@@ -135,14 +144,7 @@ export async function upsertClientPhaseTemplates(dbClient, clientId, routerPhase
          description = EXCLUDED.description,
          estimated_minutes = EXCLUDED.estimated_minutes,
          updated_at = CURRENT_TIMESTAMP`,
-      [
-        clientId,
-        name,
-        phase.description?.trim() || null,
-        phase.estimated_minutes == null || phase.estimated_minutes === ""
-          ? null
-          : Number(phase.estimated_minutes),
-      ]
+      [clientId, row.name, row.description, row.minutes]
     );
   }
 }

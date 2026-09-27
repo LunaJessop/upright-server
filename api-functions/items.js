@@ -4,6 +4,7 @@ import { resolveItemPricing } from "../lib/pricing.js";
 import { syncItemTags } from "../lib/tags.js";
 import { bomQuantityInStockUnit, unitsAreCompatible } from "../lib/units.js";
 import { resolveVendorId } from "./vendors.js";
+import { parseEstimatedMinutes } from "../lib/estimatedMinutes.js";
 
 const itemsSelect = `
   SELECT i.*,
@@ -95,6 +96,10 @@ function validateItemPayload({ name, make_or_buy, router_phases }) {
       if (seq !== i + 1) {
         return "Phase sequence must be 1, 2, 3… with no gaps";
       }
+      const parsedMinutes = parseEstimatedMinutes(phase.estimated_minutes);
+      if (!parsedMinutes.ok) {
+        return parsedMinutes.error;
+      }
     }
   }
   return null;
@@ -145,6 +150,11 @@ async function replaceRouterPhases(dbClient, clientId, itemId, routerPhases) {
 
   const inserted = [];
   for (const phase of routerPhases) {
+    const parsedMinutes = parseEstimatedMinutes(phase.estimated_minutes);
+    if (!parsedMinutes.ok) {
+      throw Object.assign(new Error(parsedMinutes.error), { status: 400 });
+    }
+
     const { rows } = await dbClient.query(
       `INSERT INTO item_router_phases
          (router_id, sequence, name, description, estimated_minutes)
@@ -155,9 +165,7 @@ async function replaceRouterPhases(dbClient, clientId, itemId, routerPhases) {
         phase.sequence,
         phase.name.trim(),
         phase.description?.trim() || null,
-        phase.estimated_minutes == null || phase.estimated_minutes === ""
-          ? null
-          : Number(phase.estimated_minutes),
+        parsedMinutes.minutes,
       ]
     );
     inserted.push(rows[0]);
