@@ -34,7 +34,7 @@ const batchesSelect = `
         'line_cost', bc.line_cost,
         'name', ci.name,
         'make_or_buy', ci.make_or_buy,
-        'unit_of_measure', ci.unit_of_measure)
+        'unit_of_measure', COALESCE(bc.unit_of_measure, ci.unit_of_measure))
         ORDER BY ci.name)
        FROM batch_components bc
        JOIN items ci ON ci.id = bc.item_id
@@ -310,14 +310,16 @@ export async function createBatch(req, res) {
       const line = lineByItemId.get(need.item_id);
       await dbClient.query(
         `INSERT INTO batch_components
-           (batch_id, item_id, quantity_allocated, unit_cost_snapshot, line_cost)
-         VALUES ($1, $2, $3, $4, $5)`,
+           (batch_id, item_id, quantity_allocated, unit_cost_snapshot, line_cost,
+            unit_of_measure)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
         [
           batch.id,
           need.item_id,
           need.quantity,
           line?.unit_cost_snapshot ?? null,
           line?.line_cost ?? null,
+          need.entered_unit ?? null,
         ]
       );
     }
