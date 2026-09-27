@@ -16,7 +16,7 @@ import {
   getVendors,
   updateVendor,
 } from "./api-functions/vendors.js";
-import { createTag, getTags } from "./api-functions/tags.js";
+import { createTag, deleteTag, getTags, updateTag } from "./api-functions/tags.js";
 import {
   getInventoryList,
   getItemInventory,
@@ -199,6 +199,8 @@ app.delete(
 
 app.get("/api/tags", requireAuth, requireReadableSubscription, getTags);
 app.post("/api/tags", requireAuth, requireActiveSubscription, createTag);
+app.patch("/api/tags/:id", requireAuth, requireActiveSubscription, updateTag);
+app.delete("/api/tags/:id", requireAuth, requireActiveSubscription, deleteTag);
 
 app.get("/api/health", async (req, res) => {
   try {
