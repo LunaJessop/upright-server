@@ -320,6 +320,8 @@ export async function createBatch(req, res) {
           need.quantity,
           line?.unit_cost_snapshot ?? null,
           line?.line_cost ?? null,
+          // Copied from the recipe. A legacy unmapped unit already on the
+          // BOM is stored as-is so batch creation does not fail for it.
           normalizeUnit(need.entered_unit) || null,
         ]
       );

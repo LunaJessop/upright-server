@@ -2,7 +2,13 @@ import { pool } from "../lib/db.js";
 import { expandProductionTree, isMakeItem as isMake } from "../lib/productionTree.js";
 import { resolveItemPricing } from "../lib/pricing.js";
 import { syncItemTags } from "../lib/tags.js";
-import { bomQuantityInStockUnit, normalizeUnit, unitsAreCompatible } from "../lib/units.js";
+import {
+  bomQuantityInStockUnit,
+  normalizeUnit,
+  resolveBomLineUnit,
+  resolveWrittenUnit,
+  unitsAreCompatible,
+} from "../lib/units.js";
 import { resolveVendorId } from "./vendors.js";
 import { parseEstimatedMinutes } from "../lib/estimatedMinutes.js";
 
@@ -179,7 +185,23 @@ async function clearItemRouter(dbClient, itemId) {
   await dbClient.query("DELETE FROM item_routers WHERE item_id = $1", [itemId]);
 }
 
-async function assertBomComponentsBelongToClient(dbClient, clientId, bomItems) {
+function storedBomUnit(existingBom, componentId, rawLineUnit) {
+  const normalized = normalizeUnit(rawLineUnit);
+  if (!normalized) return undefined;
+  const match = existingBom.find(
+    (row) =>
+      Number(row.component_item_id) === Number(componentId) &&
+      normalizeUnit(row.unit_of_measure) === normalized
+  );
+  return match?.unit_of_measure;
+}
+
+async function assertBomComponentsBelongToClient(
+  dbClient,
+  clientId,
+  bomItems,
+  existingBom = []
+) {
   if (!Array.isArray(bomItems) || bomItems.length === 0) return;
 
   const componentIds = [
@@ -211,8 +233,17 @@ async function assertBomComponentsBelongToClient(dbClient, clientId, bomItems) {
   const byId = new Map(rows.map((row) => [row.id, row]));
   for (const line of bomItems) {
     const componentId = Number(line.component_item_id);
-    const stockUnit = normalizeUnit(byId.get(componentId)?.unit_of_measure ?? "");
-    const lineUnit = normalizeUnit(line.unit_of_measure) || stockUnit;
+    const stockRaw = byId.get(componentId)?.unit_of_measure ?? "";
+    const resolved = resolveBomLineUnit(
+      line.unit_of_measure,
+      stockRaw,
+      storedBomUnit(existingBom, componentId, line.unit_of_measure)
+    );
+    if (!resolved.ok) {
+      throw Object.assign(new Error(resolved.error), { status: 400 });
+    }
+    const stockUnit = normalizeUnit(stockRaw);
+    const lineUnit = resolved.unit || "";
     if (lineUnit && stockUnit && !unitsAreCompatible(lineUnit, stockUnit)) {
       throw Object.assign(
         new Error(
@@ -242,19 +273,26 @@ async function assertBomComponentsBelongToClient(dbClient, clientId, bomItems) {
   }
 }
 
-async function insertBomLines(dbClient, parentItemId, bomItems) {
+async function insertBomLines(dbClient, parentItemId, bomItems, existingBom = []) {
   for (const line of bomItems) {
     const { rows: componentRows } = await dbClient.query(
       `SELECT unit_of_measure FROM items WHERE id = $1`,
       [line.component_item_id]
     );
-    const stockUnit = normalizeUnit(componentRows[0]?.unit_of_measure ?? "");
-    const lineUnit = normalizeUnit(line.unit_of_measure) || stockUnit || null;
+    const stockRaw = componentRows[0]?.unit_of_measure ?? "";
+    const resolved = resolveBomLineUnit(
+      line.unit_of_measure,
+      stockRaw,
+      storedBomUnit(existingBom, line.component_item_id, line.unit_of_measure)
+    );
+    if (!resolved.ok) {
+      throw Object.assign(new Error(resolved.error), { status: 400 });
+    }
 
     await dbClient.query(
       `INSERT INTO bom_items (parent_item_id, component_item_id, quantity, unit_of_measure)
        VALUES ($1, $2, $3, $4)`,
-      [parentItemId, line.component_item_id, line.quantity, lineUnit]
+      [parentItemId, line.component_item_id, line.quantity, resolved.unit]
     );
   }
 }
@@ -371,6 +409,11 @@ export async function createItem(req, res) {
     unit_sell_price,
   });
 
+  const unitResult = resolveWrittenUnit(unit_of_measure);
+  if (!unitResult.ok) {
+    return res.status(400).json({ error: unitResult.error });
+  }
+
   const { clientId, userId } = req.auth;
   const vendorSku = normalizeVendorSku(make_or_buy, sku);
   const dbClient = await pool.connect();
@@ -394,7 +437,7 @@ export async function createItem(req, res) {
         vendorSku,
         description ?? "",
         make_or_buy ?? "buy",
-        normalizeUnit(unit_of_measure),
+        unitResult.unit,
         pricing.default_unit_price,
         pricing.unit_cost,
         pricing.unit_sell_price,
@@ -478,6 +521,33 @@ export async function updateItem(req, res) {
   try {
     await dbClient.query("BEGIN");
 
+    const existing = await dbClient.query(
+      `SELECT unit_of_measure
+       FROM items
+       WHERE id = $1 AND client_id = $2
+       FOR UPDATE`,
+      [id, clientId]
+    );
+    if (existing.rows.length === 0) {
+      await dbClient.query("ROLLBACK");
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    const unitResult = resolveWrittenUnit(unit_of_measure, {
+      existing: true,
+      stored: existing.rows[0].unit_of_measure,
+    });
+    if (!unitResult.ok) {
+      throw Object.assign(new Error(unitResult.error), { status: 400 });
+    }
+
+    const { rows: existingBom } = await dbClient.query(
+      `SELECT component_item_id, unit_of_measure
+       FROM bom_items
+       WHERE parent_item_id = $1`,
+      [id]
+    );
+
     const resolvedVendor = isMakeItem(make_or_buy)
       ? null
       : await resolveVendorId(dbClient, clientId, vendor);
@@ -503,7 +573,7 @@ export async function updateItem(req, res) {
         vendorSku,
         description ?? "",
         make_or_buy ?? "buy",
-        normalizeUnit(unit_of_measure),
+        unitResult.unit,
         pricing.default_unit_price,
         pricing.unit_cost,
         pricing.unit_sell_price,
@@ -520,9 +590,14 @@ export async function updateItem(req, res) {
       return res.status(404).json({ error: "Item not found" });
     }
 
-    await assertBomComponentsBelongToClient(dbClient, clientId, bom_items);
+    await assertBomComponentsBelongToClient(
+      dbClient,
+      clientId,
+      bom_items,
+      existingBom
+    );
     await dbClient.query("DELETE FROM bom_items WHERE parent_item_id = $1", [id]);
-    await insertBomLines(dbClient, id, bom_items);
+    await insertBomLines(dbClient, id, bom_items, existingBom);
 
     const savedPhases = isMakeItem(make_or_buy)
       ? await replaceRouterPhases(dbClient, clientId, id, router_phases)
