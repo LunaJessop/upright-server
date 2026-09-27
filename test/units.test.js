@@ -4,6 +4,7 @@ import {
   bomQuantityInStockUnit,
   convertQuantity,
   getUnitFamily,
+  normalizeUnit,
   unitsAreCompatible,
 } from "../lib/units.js";
 import { FRONTEND_OFFERED_UNITS } from "./fixtures/frontend-offered-units.js";
@@ -52,4 +53,77 @@ test("tsp and tbsp are fluid-ounce units and convert in US measures", () => {
   assert.equal(bomQuantityInStockUnit(2, "tbsp", "fl_oz"), 1);
   assert.equal(bomQuantityInStockUnit(3, "tsp", "tbsp"), 1);
   assert.equal(bomQuantityInStockUnit(1, "tbsp", "tsp"), 3);
+});
+
+test("normalizeUnit maps aliases onto the canonical code and leaves unknown text trimmed", () => {
+  assert.equal(normalizeUnit(null), "");
+  assert.equal(normalizeUnit(undefined), "");
+  assert.equal(normalizeUnit("   "), "");
+
+  assert.equal(normalizeUnit("ea"), "ea");
+  assert.equal(normalizeUnit(" each "), "ea");
+  assert.equal(normalizeUnit("pieces"), "ea");
+
+  assert.equal(normalizeUnit("oz"), "oz");
+  assert.equal(normalizeUnit("ounces"), "oz");
+  assert.equal(normalizeUnit("lb"), "lb");
+  assert.equal(normalizeUnit("lbs"), "lb");
+  assert.equal(normalizeUnit("Pounds"), "lb");
+
+  assert.equal(normalizeUnit("g"), "g");
+  assert.equal(normalizeUnit("grams"), "g");
+  assert.equal(normalizeUnit("kg"), "kg");
+  assert.equal(normalizeUnit("kilograms"), "kg");
+
+  assert.equal(normalizeUnit("tsp"), "tsp");
+  assert.equal(normalizeUnit("teaspoons"), "tsp");
+  assert.equal(normalizeUnit("tbsp"), "tbsp");
+  assert.equal(normalizeUnit("Tbsp"), "tbsp");
+  assert.equal(normalizeUnit("tablespoons"), "tbsp");
+
+  assert.equal(normalizeUnit("fl_oz"), "fl_oz");
+  assert.equal(normalizeUnit("fl oz"), "fl_oz");
+  assert.equal(normalizeUnit("floz"), "fl_oz");
+  assert.equal(normalizeUnit("FL. OZ."), "fl_oz");
+  assert.equal(normalizeUnit("fluid ounces"), "fl_oz");
+
+  assert.equal(normalizeUnit("gal"), "gal");
+  assert.equal(normalizeUnit("gallon"), "gal");
+  assert.equal(normalizeUnit("gallons"), "gal");
+  assert.equal(normalizeUnit("gallon(s)"), "gal");
+
+  assert.equal(normalizeUnit("mL"), "mL");
+  assert.equal(normalizeUnit("ml"), "mL");
+  assert.equal(normalizeUnit("ML"), "mL");
+  assert.equal(normalizeUnit("milliliters"), "mL");
+  assert.equal(normalizeUnit("L"), "L");
+  assert.equal(normalizeUnit("l"), "L");
+  assert.equal(normalizeUnit("liters"), "L");
+  assert.equal(normalizeUnit("cL"), "cL");
+  assert.equal(normalizeUnit("dL"), "dL");
+
+  assert.equal(normalizeUnit("sq ft"), "sq_ft");
+  assert.equal(normalizeUnit("square feet"), "sq_ft");
+  assert.equal(normalizeUnit("short ton"), "short_ton");
+
+  assert.equal(normalizeUnit("  Custom Box  "), "Custom Box");
+  assert.equal(normalizeUnit("ton"), "ton");
+
+  for (const unit of FRONTEND_OFFERED_UNITS) {
+    assert.equal(
+      normalizeUnit(unit.value),
+      unit.value,
+      `frontend picker value ${unit.value} should already be canonical`
+    );
+  }
+});
+
+test("alias spelling uses the same conversion factors as the canonical code", () => {
+  assert.equal(convertQuantity(1, "gallon", "fl oz"), 128);
+  assert.equal(convertQuantity(1, "Tbsp", "floz"), 0.5);
+  assert.equal(convertQuantity(2, "lbs", "oz"), 32);
+  assert.equal(bomQuantityInStockUnit(6, "teaspoons", "fluid ounce"), 1);
+  assert.equal(unitsAreCompatible("mL", "liters"), true);
+  assert.equal(unitsAreCompatible("tbsp", "ml"), false);
+  assert.equal(getUnitFamily("FL OZ"), "volume_imperial");
 });
