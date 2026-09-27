@@ -44,7 +44,7 @@ test("tsp and tbsp are fluid-ounce units and convert in US measures", () => {
   assert.equal(unitsAreCompatible("tsp", "fl_oz"), true);
   assert.equal(unitsAreCompatible("tbsp", "fl_oz"), true);
   assert.equal(unitsAreCompatible("tsp", "cup"), true);
-  assert.equal(unitsAreCompatible("tbsp", "mL"), false);
+  assert.equal(unitsAreCompatible("tbsp", "mL"), true);
 
   // 6 tsp = 2 tbsp = 1 fl oz; 3 tsp = 1 tbsp.
   assert.equal(convertQuantity(1, "tsp", "fl_oz"), 1 / 6);
@@ -124,6 +124,55 @@ test("alias spelling uses the same conversion factors as the canonical code", ()
   assert.equal(convertQuantity(2, "lbs", "oz"), 32);
   assert.equal(bomQuantityInStockUnit(6, "teaspoons", "fluid ounce"), 1);
   assert.equal(unitsAreCompatible("mL", "liters"), true);
-  assert.equal(unitsAreCompatible("tbsp", "ml"), false);
+  assert.equal(unitsAreCompatible("tbsp", "ml"), true);
   assert.equal(getUnitFamily("FL OZ"), "volume_imperial");
+});
+
+test("weight converts between metric and imperial without disturbing count or volume", () => {
+  // 1 lb = 0.45359237 kg exactly, which displays as 453.592 g.
+  assert.equal(convertQuantity(1, "lb", "g").toFixed(3), "453.592");
+  assert.ok(Math.abs(convertQuantity(1, "lb", "g") - 453.59237) < 1e-6);
+  // 1 kg = 2.20462 lb at five decimal places.
+  assert.equal(convertQuantity(1, "kg", "lb").toFixed(5), "2.20462");
+  assert.equal(convertQuantity(16, "oz", "lb"), 1);
+  assert.equal(convertQuantity(1, "lb", "oz"), 16);
+  assert.equal(unitsAreCompatible("g", "oz"), true);
+  assert.equal(unitsAreCompatible("kg", "lb"), true);
+  assert.equal(unitsAreCompatible("mg", "short_ton"), true);
+  assert.equal(unitsAreCompatible("g", "mL"), false);
+  assert.equal(unitsAreCompatible("oz", "fl_oz"), false);
+  assert.equal(unitsAreCompatible("ea", "g"), false);
+  assert.equal(unitsAreCompatible("ea", "oz"), false);
+  assert.equal(convertQuantity(1, "g", "mL"), null);
+  assert.equal(convertQuantity(1, "lb", "gal"), null);
+  assert.equal(bomQuantityInStockUnit(1, "ea", "g"), null);
+
+  const backToPounds = convertQuantity(convertQuantity(1, "lb", "g"), "g", "lb");
+  assert.ok(Math.abs(backToPounds - 1) < 1e-9);
+  const backToGrams = convertQuantity(convertQuantity(1000, "g", "oz"), "oz", "g");
+  assert.ok(Math.abs(backToGrams - 1000) < 1e-6);
+});
+
+test("US volume converts between metric and imperial", () => {
+  // 1 fl oz = 29.5735295625 mL, which displays as 29.5735 mL.
+  assert.equal(convertQuantity(1, "fl_oz", "mL").toFixed(4), "29.5735");
+  // 1 gal = 3785.411784 mL, which displays as 3785.41 mL.
+  assert.equal(convertQuantity(1, "gal", "mL").toFixed(2), "3785.41");
+  assert.equal(convertQuantity(1, "gal", "fl_oz"), 128);
+  assert.equal(convertQuantity(1, "L", "mL"), 1000);
+  assert.equal(unitsAreCompatible("mL", "fl_oz"), true);
+  assert.equal(unitsAreCompatible("L", "gal"), true);
+  assert.equal(unitsAreCompatible("tsp", "L"), true);
+  assert.equal(unitsAreCompatible("cup", "g"), false);
+  assert.equal(convertQuantity(1, "mL", "oz"), null);
+
+  const oneFlOz = convertQuantity(convertQuantity(1, "fl_oz", "mL"), "mL", "fl_oz");
+  assert.ok(Math.abs(oneFlOz - 1) < 1e-9);
+  const oneGallon = convertQuantity(convertQuantity(1, "gal", "L"), "L", "gal");
+  assert.ok(Math.abs(oneGallon - 1) < 1e-9);
+  // 6 tsp is still exactly 1 fl oz; the metric bridge does not change that.
+  assert.equal(bomQuantityInStockUnit(6, "tsp", "fl_oz"), 1);
+  assert.ok(
+    Math.abs(bomQuantityInStockUnit(29.5735295625, "mL", "fl_oz") - 1) < 1e-9
+  );
 });
