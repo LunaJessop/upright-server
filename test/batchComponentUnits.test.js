@@ -199,6 +199,84 @@ describe("batch component units on create", { concurrency: 1 }, () => {
     );
   });
 
+  it("converts a metric recipe line into the imperial stock unit", async () => {
+    const items = new Map([
+      [
+        1,
+        item({
+          id: 1,
+          name: "Soap",
+          make_or_buy: "make",
+          unit_of_measure: "ea",
+          unit_sell_price: 12,
+        }),
+      ],
+      [
+        2,
+        item({
+          id: 2,
+          name: "Oil",
+          make_or_buy: "buy",
+          unit_of_measure: "fl_oz",
+          unit_cost: 2,
+        }),
+      ],
+      [
+        3,
+        item({
+          id: 3,
+          name: "Lye",
+          make_or_buy: "buy",
+          unit_of_measure: "oz",
+          unit_cost: 1,
+        }),
+      ],
+    ]);
+    const bomByParent = new Map([
+      [
+        1,
+        [
+          bomLine({
+            component_item_id: 2,
+            quantity: 29.5735295625,
+            bom_unit_of_measure: "mL",
+            component_name: "Oil",
+            make_or_buy: "buy",
+            unit_of_measure: "fl_oz",
+          }),
+          bomLine({
+            component_item_id: 3,
+            quantity: 453.59237,
+            bom_unit_of_measure: "g",
+            component_name: "Lye",
+            make_or_buy: "buy",
+            unit_of_measure: "oz",
+          }),
+        ],
+      ],
+    ]);
+    const queries = installBatchDb(items, bomByParent);
+    const res = mockRes();
+
+    await createBatch(
+      {
+        auth: { clientId: 7, userId: 9 },
+        body: { item_id: 1, quantity: 2, sku: "LOT-MIX" },
+      },
+      res
+    );
+
+    assert.equal(res.statusCode, 201);
+    const inserts = componentInserts(queries);
+    const byItem = new Map(inserts.map((query) => [query.params[1], query.params]));
+    // 29.5735295625 mL = 1 fl oz, times batch quantity 2.
+    assert.ok(Math.abs(byItem.get(2)[2] - 2) < 1e-9);
+    assert.equal(byItem.get(2)[5], "mL");
+    // 453.59237 g = 16 oz, times batch quantity 2.
+    assert.ok(Math.abs(byItem.get(3)[2] - 32) < 1e-9);
+    assert.equal(byItem.get(3)[5], "g");
+  });
+
   it("falls back to the item stock unit when the BOM line unit is blank", async () => {
     const items = new Map([
       [

@@ -32,7 +32,7 @@ function mockRes() {
 const UNKNOWN_UNIT_ERROR =
   'Unknown unit "widgets". Pick a unit from the list, like each, oz, lb, fl oz, cup, g, or mL.';
 
-function installItemDb(storedUnit = "ea") {
+function installItemDb(storedUnit = "ea", componentUnit = null) {
   const queries = [];
   pool.connect = async () => ({
     async query(sql, params = []) {
@@ -61,10 +61,14 @@ function installItemDb(storedUnit = "ea") {
         return { rows: [] };
       }
       if (text.includes("SELECT id, unit_of_measure")) {
-        return { rows: [{ id: 2, unit_of_measure: "fl_oz" }] };
+        return {
+          rows: [{ id: 2, unit_of_measure: componentUnit ?? "fl_oz" }],
+        };
       }
       if (text.includes("SELECT unit_of_measure FROM items")) {
-        return { rows: [{ unit_of_measure: "fl oz" }] };
+        return {
+          rows: [{ unit_of_measure: componentUnit ?? "fl oz" }],
+        };
       }
       if (text.includes("INSERT INTO bom_items")) return { rows: [] };
       return { rows: [] };
@@ -263,6 +267,51 @@ describe("unit writes are stored canonically", { concurrency: 1 }, () => {
       bomInserts.map((query) => query.params[3]),
       ["tbsp", "fl_oz"]
     );
+  });
+
+  it("accepts a metric BOM line on an imperial stock unit", async () => {
+    const queries = installItemDb("ea", "oz");
+    const res = mockRes();
+    await createItem(
+      {
+        auth: { clientId: 4, userId: 9 },
+        body: itemBody({
+          name: "Soap",
+          make_or_buy: "make",
+          unit_of_measure: "ea",
+          bom_items: [
+            { component_item_id: 2, quantity: 100, unit_of_measure: "g" },
+          ],
+        }),
+      },
+      res
+    );
+    assert.equal(res.statusCode, 201);
+    const bomInsert = queries.find((query) =>
+      query.sql.includes("INSERT INTO bom_items")
+    );
+    assert.equal(bomInsert.params[3], "g");
+  });
+
+  it("still rejects a weight line on a volume stock unit", async () => {
+    installItemDb("ea", "fl_oz");
+    const res = mockRes();
+    await createItem(
+      {
+        auth: { clientId: 4, userId: 9 },
+        body: itemBody({
+          name: "Soap",
+          make_or_buy: "make",
+          unit_of_measure: "ea",
+          bom_items: [
+            { component_item_id: 2, quantity: 100, unit_of_measure: "g" },
+          ],
+        }),
+      },
+      res
+    );
+    assert.equal(res.statusCode, 400);
+    assert.match(res.body.error, /not compatible with component stock unit/);
   });
 
   it("stores a canonical batch component unit without changing the converted quantity", async () => {
