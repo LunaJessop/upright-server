@@ -1,6 +1,11 @@
 import bcrypt from "bcryptjs";
 import { pool } from "../lib/db.js";
-import { signAuthToken, userResponse } from "../lib/auth.js";
+import {
+  logMissingTokenVersion,
+  revokeUserTokens,
+  signAuthToken,
+  userResponse,
+} from "../lib/auth.js";
 import {
   getStripe,
   passwordMeetsPolicy,
@@ -39,6 +44,42 @@ function isEmailUniqueViolation(err) {
   return String(err.detail ?? "").includes("(email)");
 }
 
+function tokenForUser(user) {
+  return signAuthToken({
+    userId: user.id,
+    tokenVersion: Number(user.token_version),
+  });
+}
+
+function schemaOutOfDate(res) {
+  return res.status(503).json({ error: "Server auth schema is out of date" });
+}
+
+export function createLogoutHandler(revoke = revokeUserTokens) {
+  return async function logout(req, res) {
+    const userId = req.auth?.userId;
+    if (!Number.isInteger(userId)) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    try {
+      const updated = await revoke(userId);
+      if (!updated) {
+        return res.status(401).json({ error: "Invalid or expired session" });
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      console.error(err);
+      if (logMissingTokenVersion(err)) {
+        return schemaOutOfDate(res);
+      }
+      res.status(500).json({ error: "Logout failed" });
+    }
+  };
+}
+
+export const logout = createLogoutHandler();
+
 export async function login(req, res) {
   const { email, password } = req.body ?? {};
 
@@ -60,7 +101,8 @@ export async function login(req, res) {
 
   try {
     const { rows } = await pool.query(
-      `SELECT u.id, u.client_id, u.name, u.email, u.password_hash, u.role, u.active, u.created_at,
+      `SELECT u.id, u.client_id, u.name, u.email, u.password_hash, u.role, u.active,
+              u.token_version, u.created_at,
               c.name AS client_name,
               c.slug AS client_slug,
               c.email AS client_email,
@@ -90,12 +132,7 @@ export async function login(req, res) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    const token = signAuthToken({
-      userId: user.id,
-      clientId: user.client_id,
-      role: user.role,
-      email: user.email,
-    });
+    const token = tokenForUser(user);
 
     res.json({
       token,
@@ -107,6 +144,9 @@ export async function login(req, res) {
       return res.status(503).json({
         error: "Server auth is not configured (JWT_SECRET missing)",
       });
+    }
+    if (logMissingTokenVersion(err)) {
+      return schemaOutOfDate(res);
     }
     res.status(500).json({ error: "Login failed" });
   }
@@ -174,7 +214,7 @@ export async function register(req, res) {
     const userInsert = await db.query(
       `INSERT INTO users (client_id, name, email, password_hash, role, active)
        VALUES ($1, $2, $3, $4, 'founder', TRUE)
-       RETURNING id, client_id, name, email, role, active`,
+       RETURNING id, client_id, name, email, role, active, token_version`,
       [clientId, trimmedName, normalizedEmail, passwordHash]
     );
 
@@ -192,6 +232,9 @@ export async function register(req, res) {
     console.error(err);
     if (err.code === "23505" && isEmailUniqueViolation(err)) {
       return res.status(400).json({ error: ACCOUNT_NOT_CREATED_MESSAGE });
+    }
+    if (logMissingTokenVersion(err)) {
+      return schemaOutOfDate(res);
     }
     return res.status(500).json({ error: "Registration failed" });
   } finally {
@@ -219,12 +262,7 @@ export async function register(req, res) {
   }
 
   try {
-    const token = signAuthToken({
-      userId: userRow.id,
-      clientId: userRow.client_id,
-      role: userRow.role,
-      email: userRow.email,
-    });
+    const token = tokenForUser(userRow);
 
     res.status(201).json({
       token,
@@ -236,6 +274,9 @@ export async function register(req, res) {
       return res.status(503).json({
         error: "Server auth is not configured (JWT_SECRET missing)",
       });
+    }
+    if (logMissingTokenVersion(err)) {
+      return schemaOutOfDate(res);
     }
     res.status(500).json({ error: "Registration succeeded but session failed" });
   }
