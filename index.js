@@ -27,7 +27,7 @@ import {
   deletePurchaseLot,
   getPurchaseLotsForItem,
 } from "./api-functions/purchaseLots.js";
-import { getMe, login, register } from "./api-functions/auth.js";
+import { getMe, login, logout, register } from "./api-functions/auth.js";
 import { createCheckout, createPortal } from "./api-functions/billing.js";
 import { createClientUser, getClient } from "./api-functions/clients.js";
 import { listClients } from "./api-functions/admin.js";
@@ -57,6 +57,7 @@ app.use(express.json());
 
 app.post("/api/auth/login", login);
 app.post("/api/auth/register", register);
+app.post("/api/auth/logout", requireAuth, logout);
 app.get("/api/auth/me", requireAuth, getMe);
 
 app.post("/api/billing/checkout", requireAuth, requireFounder, createCheckout);

@@ -82,6 +82,7 @@ async function main() {
           password_hash TEXT NOT NULL,
           role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('founder', 'admin', 'user')),
           active BOOLEAN DEFAULT TRUE,
+          token_version INTEGER NOT NULL DEFAULT 0,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -95,6 +96,13 @@ async function main() {
         ALTER TABLE users ADD CONSTRAINT users_role_check
           CHECK (role IN ('founder', 'admin', 'user'))
       `);
+    }
+
+    if (!(await columnExists(client, "users", "token_version"))) {
+      await client.query(
+        `ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0`
+      );
+      console.log("Added users.token_version");
     }
 
     if (await tableExists(client, "items")) {
