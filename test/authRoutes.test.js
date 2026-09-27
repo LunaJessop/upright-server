@@ -155,6 +155,7 @@ describe("login route", { concurrency: 1 }, () => {
       subscription_status: "active",
       past_due_started_at: null,
       stripe_price_id: null,
+      token_version: 0,
     };
 
     const wrongQueries = installPool({ userRows: [{ ...user }] });
@@ -360,6 +361,7 @@ describe("register route", { concurrency: 1 }, () => {
                 email: params[2],
                 role: "founder",
                 active: true,
+                token_version: 0,
               },
             ],
           };
