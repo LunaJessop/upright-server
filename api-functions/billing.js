@@ -1,4 +1,5 @@
 import {
+  AlreadySubscribedError,
   createCheckoutSessionForClient,
   createPortalSessionForClient,
   getClientBilling,
@@ -19,10 +20,6 @@ export async function createCheckout(req, res) {
       return res.status(404).json({ error: "Client not found" });
     }
 
-    if (client.subscription_status === "active") {
-      return res.status(400).json({ error: "Subscription is already active" });
-    }
-
     const session = await createCheckoutSessionForClient(client, plan);
     if (!session.url) {
       return res.status(500).json({ error: "Failed to create checkout session" });
@@ -30,6 +27,9 @@ export async function createCheckout(req, res) {
 
     res.json({ checkoutUrl: session.url, plan });
   } catch (err) {
+    if (err instanceof AlreadySubscribedError) {
+      return res.status(400).json({ error: err.message });
+    }
     console.error(err);
     if (err.message?.includes("STRIPE_")) {
       return res.status(503).json({ error: err.message });

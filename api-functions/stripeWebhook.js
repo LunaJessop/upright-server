@@ -1,8 +1,75 @@
 import { pool } from "../lib/db.js";
 import {
+  cancelAndRefundDuplicateSubscription,
   getStripe,
+  isLiveSubscriptionStatus,
+  liveSubscriptionStatusSqlList,
   periodEndFromSubscription,
 } from "../lib/billing.js";
+
+function subscriptionGuard(paramIndex) {
+  return `(
+    stripe_subscription_id IS NULL
+    OR stripe_subscription_id = $${paramIndex}
+    OR subscription_status NOT IN (${liveSubscriptionStatusSqlList()})
+  )`;
+}
+
+/**
+ * Write subscription fields only when this event belongs to the subscription
+ * already on the account, or the account has no live subscription yet.
+ * A lost race or a second subscription returns no row.
+ */
+async function updateClientSubscription(clientId, sql, params, subscription) {
+  const result = await pool.query(sql, params);
+  if (result.rows?.length > 0) return;
+  await handleUnclaimedSubscription(clientId, subscription);
+}
+
+async function handleUnclaimedSubscription(clientId, subscription) {
+  const incomingId = subscription?.id ?? null;
+  const { rows } = await pool.query(
+    `SELECT stripe_subscription_id, subscription_status
+     FROM clients
+     WHERE id = $1`,
+    [clientId]
+  );
+  const row = rows[0];
+  if (!row) {
+    console.warn(
+      "Stripe subscription event for missing client",
+      clientId,
+      incomingId
+    );
+    return;
+  }
+
+  const keptId = row.stripe_subscription_id;
+  const differentLive =
+    incomingId &&
+    keptId &&
+    keptId !== incomingId &&
+    isLiveSubscriptionStatus(row.subscription_status);
+
+  if (!differentLive) {
+    console.error(
+      `Stripe subscription ${incomingId ?? "?"} (${subscription?.status ?? "?"}) for client ${clientId} was not saved.`
+    );
+    return;
+  }
+
+  if (!isLiveSubscriptionStatus(subscription?.status)) {
+    console.error(
+      `Ignoring ${subscription?.status ?? "unknown"} subscription ${incomingId} for client ${clientId}; keeping ${keptId}.`
+    );
+    return;
+  }
+
+  console.error(
+    `Duplicate Stripe subscription ${incomingId} for client ${clientId}; keeping ${keptId}. Canceling and refunding the duplicate.`
+  );
+  await cancelAndRefundDuplicateSubscription(getStripe(), subscription);
+}
 
 async function findClientIdFromCustomer(customerId) {
   if (!customerId) return null;
@@ -28,7 +95,8 @@ async function markActive(clientId, subscription) {
     process.env.STRIPE_PRICE_ID?.trim() ??
     null;
 
-  await pool.query(
+  await updateClientSubscription(
+    clientId,
     `UPDATE clients SET
        stripe_subscription_id = COALESCE($2, stripe_subscription_id),
        stripe_price_id = COALESCE($3, stripe_price_id),
@@ -36,13 +104,16 @@ async function markActive(clientId, subscription) {
        past_due_started_at = NULL,
        current_period_end = $4,
        updated_at = CURRENT_TIMESTAMP
-     WHERE id = $1`,
+     WHERE id = $1
+       AND ${subscriptionGuard(2)}
+     RETURNING id`,
     [
       clientId,
       subscription?.id ?? null,
       priceId,
       periodEndFromSubscription(subscription),
-    ]
+    ],
+    subscription
   );
 }
 
@@ -63,7 +134,8 @@ async function syncSubscription(subscription) {
   }
 
   if (status === "past_due" || status === "unpaid") {
-    await pool.query(
+    await updateClientSubscription(
+      clientId,
       `UPDATE clients SET
          stripe_subscription_id = $2,
          stripe_price_id = COALESCE($3, stripe_price_id),
@@ -71,14 +143,18 @@ async function syncSubscription(subscription) {
          past_due_started_at = COALESCE(past_due_started_at, CURRENT_TIMESTAMP),
          current_period_end = $5,
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [clientId, subscription.id, priceId, status, periodEnd]
+       WHERE id = $1
+         AND ${subscriptionGuard(2)}
+       RETURNING id`,
+      [clientId, subscription.id, priceId, status, periodEnd],
+      subscription
     );
     return;
   }
 
   if (status === "canceled" || status === "incomplete_expired") {
-    await pool.query(
+    await updateClientSubscription(
+      clientId,
       `UPDATE clients SET
          stripe_subscription_id = $2,
          stripe_price_id = COALESCE($3, stripe_price_id),
@@ -86,8 +162,11 @@ async function syncSubscription(subscription) {
          past_due_started_at = NULL,
          current_period_end = $4,
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [clientId, subscription.id, priceId, periodEnd]
+       WHERE id = $1
+         AND ${subscriptionGuard(2)}
+       RETURNING id`,
+      [clientId, subscription.id, priceId, periodEnd],
+      { ...subscription, status: "canceled" }
     );
   }
 }
@@ -105,10 +184,15 @@ async function handleCheckoutCompleted(session) {
   const stripe = getStripe();
   let subscription = null;
   if (session.subscription) {
-    subscription = await stripe.subscriptions.retrieve(session.subscription);
+    const subscriptionId =
+      typeof session.subscription === "string"
+        ? session.subscription
+        : session.subscription.id;
+    subscription = await stripe.subscriptions.retrieve(subscriptionId);
   }
 
-  await pool.query(
+  await updateClientSubscription(
+    clientId,
     `UPDATE clients SET
        stripe_customer_id = COALESCE($2, stripe_customer_id),
        stripe_subscription_id = COALESCE($3, stripe_subscription_id),
@@ -117,16 +201,19 @@ async function handleCheckoutCompleted(session) {
        past_due_started_at = NULL,
        current_period_end = $5,
        updated_at = CURRENT_TIMESTAMP
-     WHERE id = $1`,
+     WHERE id = $1
+       AND ${subscriptionGuard(3)}
+     RETURNING id`,
     [
       clientId,
       session.customer ?? null,
-      subscription?.id ?? session.subscription ?? null,
+      subscription?.id ?? null,
       subscription?.items?.data?.[0]?.price?.id ??
         process.env.STRIPE_PRICE_ID?.trim() ??
         null,
       periodEndFromSubscription(subscription),
-    ]
+    ],
+    subscription
   );
 }
 
@@ -135,14 +222,27 @@ async function handleInvoicePaymentFailed(invoice) {
   const clientId = await findClientIdFromCustomer(customerId);
   if (!clientId) return;
 
-  await pool.query(
+  const subscriptionId =
+    typeof invoice.subscription === "string"
+      ? invoice.subscription
+      : invoice.subscription?.id ?? null;
+
+  await updateClientSubscription(
+    clientId,
     `UPDATE clients SET
        subscription_status = 'past_due',
        past_due_started_at = COALESCE(past_due_started_at, CURRENT_TIMESTAMP),
        stripe_subscription_id = COALESCE($2, stripe_subscription_id),
        updated_at = CURRENT_TIMESTAMP
-     WHERE id = $1`,
-    [clientId, invoice.subscription ?? null]
+     WHERE id = $1
+       AND ${subscriptionGuard(2)}
+     RETURNING id`,
+    [clientId, subscriptionId],
+    {
+      id: subscriptionId,
+      status: "past_due",
+      latest_invoice: invoice.id ?? null,
+    }
   );
 }
 
