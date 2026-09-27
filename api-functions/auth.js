@@ -6,12 +6,56 @@ import {
   passwordMeetsPolicy,
   uniqueSlug,
 } from "../lib/billing.js";
+import {
+  clientIp,
+  consumeAuthRateLimit,
+  inspectAuthRateLimit,
+  rateLimitErrorMessage,
+} from "../lib/authRateLimit.js";
+
+// Same cost factor as real password hashes so an unknown email is not a fast oracle.
+const DUMMY_PASSWORD_HASH =
+  "$2b$10$VYJ4BbjZQ9YYqBHtlOICMuwRJ6f3PJGAzFY3MYZomxRV/cq3iaefi";
+
+// Signup returns a session immediately, so a taken email cannot use the same
+// 201 as a new account without handing out that session. This copy does not
+// say the address is registered; per-email and per-IP limits slow probing.
+const ACCOUNT_NOT_CREATED_MESSAGE =
+  "We couldn't create an account with those details. If you already have an account, log in.";
+
+function dbQuery(sql, params) {
+  return pool.query(sql, params);
+}
+
+function sendRateLimited(res, retryAfterSeconds) {
+  const seconds = Math.max(1, Number(retryAfterSeconds) || 1);
+  res.setHeader("Retry-After", String(seconds));
+  return res.status(429).json({ error: rateLimitErrorMessage(seconds) });
+}
+
+function isEmailUniqueViolation(err) {
+  const constraint = String(err.constraint ?? "").toLowerCase();
+  if (constraint.includes("email")) return true;
+  return String(err.detail ?? "").includes("(email)");
+}
 
 export async function login(req, res) {
   const { email, password } = req.body ?? {};
 
   if (!email?.trim() || !password) {
     return res.status(400).json({ error: "Email and password are required" });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const rateLimit = {
+    action: "login",
+    ip: clientIp(req),
+    email: normalizedEmail,
+  };
+
+  const gate = await inspectAuthRateLimit(dbQuery, rateLimit);
+  if (gate.limited) {
+    return sendRateLimited(res, gate.retryAfterSeconds);
   }
 
   try {
@@ -24,21 +68,25 @@ export async function login(req, res) {
        FROM users u
        JOIN clients c ON c.id = u.client_id
        WHERE LOWER(u.email) = LOWER($1)`,
-      [email.trim()]
+      [normalizedEmail]
     );
 
     if (rows.length === 0) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+      await consumeAuthRateLimit(dbQuery, rateLimit);
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
     const user = rows[0];
 
     if (!user.active) {
+      await consumeAuthRateLimit(dbQuery, rateLimit);
       return res.status(403).json({ error: "This account is inactive" });
     }
 
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
+      await consumeAuthRateLimit(dbQuery, rateLimit);
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
@@ -84,6 +132,20 @@ export async function register(req, res) {
   const trimmedCompany = companyName.trim();
   const trimmedName = name.trim();
 
+  const rateLimit = {
+    action: "register",
+    ip: clientIp(req),
+    email: normalizedEmail,
+  };
+  const gate = await inspectAuthRateLimit(dbQuery, rateLimit);
+  if (gate.limited) {
+    return sendRateLimited(res, gate.retryAfterSeconds);
+  }
+  await consumeAuthRateLimit(dbQuery, rateLimit);
+
+  // Hash before the existence check so a taken email is not a fast response.
+  const passwordHash = await bcrypt.hash(password, 10);
+
   const db = await pool.connect();
   let clientId;
   let userRow;
@@ -97,7 +159,7 @@ export async function register(req, res) {
     );
     if (existing.rows.length > 0) {
       await db.query("ROLLBACK");
-      return res.status(409).json({ error: "An account with this email already exists" });
+      return res.status(400).json({ error: ACCOUNT_NOT_CREATED_MESSAGE });
     }
 
     const slug = await uniqueSlug(db, trimmedCompany);
@@ -109,7 +171,6 @@ export async function register(req, res) {
     );
     clientId = clientInsert.rows[0].id;
 
-    const passwordHash = await bcrypt.hash(password, 10);
     const userInsert = await db.query(
       `INSERT INTO users (client_id, name, email, password_hash, role, active)
        VALUES ($1, $2, $3, $4, 'founder', TRUE)
@@ -129,8 +190,8 @@ export async function register(req, res) {
   } catch (err) {
     await db.query("ROLLBACK");
     console.error(err);
-    if (err.code === "23505") {
-      return res.status(409).json({ error: "An account with this email already exists" });
+    if (err.code === "23505" && isEmailUniqueViolation(err)) {
+      return res.status(400).json({ error: ACCOUNT_NOT_CREATED_MESSAGE });
     }
     return res.status(500).json({ error: "Registration failed" });
   } finally {
