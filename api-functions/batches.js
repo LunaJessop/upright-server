@@ -1,6 +1,7 @@
 import { pool } from "../lib/db.js";
 import { expandProductionTree, isMakeItem } from "../lib/productionTree.js";
 import { computeBatchEconomics } from "../lib/pricing.js";
+import { normalizeUnit } from "../lib/units.js";
 
 const batchesSelect = `
   SELECT b.*,
@@ -319,7 +320,7 @@ export async function createBatch(req, res) {
           need.quantity,
           line?.unit_cost_snapshot ?? null,
           line?.line_cost ?? null,
-          need.entered_unit ?? null,
+          normalizeUnit(need.entered_unit) || null,
         ]
       );
     }

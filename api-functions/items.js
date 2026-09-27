@@ -2,7 +2,7 @@ import { pool } from "../lib/db.js";
 import { expandProductionTree, isMakeItem as isMake } from "../lib/productionTree.js";
 import { resolveItemPricing } from "../lib/pricing.js";
 import { syncItemTags } from "../lib/tags.js";
-import { bomQuantityInStockUnit, unitsAreCompatible } from "../lib/units.js";
+import { bomQuantityInStockUnit, normalizeUnit, unitsAreCompatible } from "../lib/units.js";
 import { resolveVendorId } from "./vendors.js";
 import { parseEstimatedMinutes } from "../lib/estimatedMinutes.js";
 
@@ -211,8 +211,8 @@ async function assertBomComponentsBelongToClient(dbClient, clientId, bomItems) {
   const byId = new Map(rows.map((row) => [row.id, row]));
   for (const line of bomItems) {
     const componentId = Number(line.component_item_id);
-    const stockUnit = byId.get(componentId)?.unit_of_measure ?? "";
-    const lineUnit = String(line.unit_of_measure ?? "").trim() || stockUnit;
+    const stockUnit = normalizeUnit(byId.get(componentId)?.unit_of_measure ?? "");
+    const lineUnit = normalizeUnit(line.unit_of_measure) || stockUnit;
     if (lineUnit && stockUnit && !unitsAreCompatible(lineUnit, stockUnit)) {
       throw Object.assign(
         new Error(
@@ -248,9 +248,8 @@ async function insertBomLines(dbClient, parentItemId, bomItems) {
       `SELECT unit_of_measure FROM items WHERE id = $1`,
       [line.component_item_id]
     );
-    const stockUnit = componentRows[0]?.unit_of_measure ?? "";
-    const lineUnit =
-      String(line.unit_of_measure ?? "").trim() || stockUnit || null;
+    const stockUnit = normalizeUnit(componentRows[0]?.unit_of_measure ?? "");
+    const lineUnit = normalizeUnit(line.unit_of_measure) || stockUnit || null;
 
     await dbClient.query(
       `INSERT INTO bom_items (parent_item_id, component_item_id, quantity, unit_of_measure)
@@ -395,7 +394,7 @@ export async function createItem(req, res) {
         vendorSku,
         description ?? "",
         make_or_buy ?? "buy",
-        unit_of_measure ?? "",
+        normalizeUnit(unit_of_measure),
         pricing.default_unit_price,
         pricing.unit_cost,
         pricing.unit_sell_price,
@@ -504,7 +503,7 @@ export async function updateItem(req, res) {
         vendorSku,
         description ?? "",
         make_or_buy ?? "buy",
-        unit_of_measure ?? "",
+        normalizeUnit(unit_of_measure),
         pricing.default_unit_price,
         pricing.unit_cost,
         pricing.unit_sell_price,
