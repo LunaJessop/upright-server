@@ -1,5 +1,6 @@
 import "dotenv/config";
 import cors from "cors";
+import { corsOptions } from "./lib/cors.js";
 import express from "express";
 import { createItem, deleteItem, getItemById, getItemProductionTree, getItems, updateItem } from "./api-functions/items.js";
 import { createBatch, getBatchById, getBatches, updateBatchPhase, cancelBatch, completeBatch } from "./api-functions/batches.js";
@@ -44,7 +45,7 @@ import { pool } from "./lib/db.js";
 export { pool };
 
 const app = express();
-app.use(cors());
+app.use(cors(corsOptions));
 
 // Stripe webhooks need the raw body for signature verification.
 app.post(
