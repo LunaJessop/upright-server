@@ -29,7 +29,10 @@ function mockRes() {
   };
 }
 
-function installItemDb() {
+const UNKNOWN_UNIT_ERROR =
+  'Unknown unit "widgets". Pick a unit from the list, like each, oz, lb, fl oz, cup, g, or mL.';
+
+function installItemDb(storedUnit = "ea") {
   const queries = [];
   pool.connect = async () => ({
     async query(sql, params = []) {
@@ -43,13 +46,19 @@ function installItemDb() {
           rows: [
             {
               id: 10,
-              name: params[0],
+              name: text.includes("INSERT INTO items") ? params[1] : params[0],
               unit_of_measure: text.includes("INSERT INTO items")
                 ? params[5]
                 : params[4],
             },
           ],
         };
+      }
+      if (text.includes("FOR UPDATE")) {
+        return { rows: [{ unit_of_measure: storedUnit }] };
+      }
+      if (text.includes("FROM bom_items") && text.includes("parent_item_id")) {
+        return { rows: [] };
       }
       if (text.includes("SELECT id, unit_of_measure")) {
         return { rows: [{ id: 2, unit_of_measure: "fl_oz" }] };
@@ -80,7 +89,7 @@ after(async () => {
 });
 
 describe("unit writes are stored canonically", { concurrency: 1 }, () => {
-  it("stores a canonical item unit and trims unknown units without rejecting them", async () => {
+  it("stores an alias as the canonical item unit and still allows a blank unit", async () => {
     const canonicalQueries = installItemDb();
     const canonical = mockRes();
     await createItem(
@@ -96,20 +105,120 @@ describe("unit writes are stored canonically", { concurrency: 1 }, () => {
     );
     assert.equal(insert.params[5], "gal");
 
-    const unknownQueries = installItemDb();
-    const unknown = mockRes();
+    const blankQueries = installItemDb();
+    const blank = mockRes();
     await createItem(
       {
         auth: { clientId: 4, userId: 9 },
-        body: itemBody({ unit_of_measure: "  Custom Box  " }),
+        body: itemBody({ unit_of_measure: "   " }),
       },
-      unknown
+      blank
     );
-    assert.equal(unknown.statusCode, 201);
-    const unknownInsert = unknownQueries.find((query) =>
+    assert.equal(blank.statusCode, 201);
+    const blankInsert = blankQueries.find((query) =>
       query.sql.includes("INSERT INTO items")
     );
-    assert.equal(unknownInsert.params[5], "Custom Box");
+    assert.equal(blankInsert.params[5], "");
+  });
+
+  it("rejects an unknown unit on item create", async () => {
+    const queries = installItemDb();
+    const res = mockRes();
+    await createItem(
+      {
+        auth: { clientId: 4, userId: 9 },
+        body: itemBody({ unit_of_measure: "widgets" }),
+      },
+      res
+    );
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.error, UNKNOWN_UNIT_ERROR);
+    assert.equal(
+      queries.some((query) => query.sql.includes("INSERT INTO items")),
+      false
+    );
+  });
+
+  it("rejects an unknown unit on item update", async () => {
+    const queries = installItemDb("ea");
+    const res = mockRes();
+    await updateItem(
+      {
+        auth: { clientId: 4, userId: 9 },
+        params: { id: "10" },
+        body: itemBody({ unit_of_measure: "widgets" }),
+      },
+      res
+    );
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.error, UNKNOWN_UNIT_ERROR);
+    assert.equal(
+      queries.some((query) => query.sql.includes("UPDATE items")),
+      false
+    );
+  });
+
+  it("rejects an unknown unit on BOM insert", async () => {
+    const queries = installItemDb();
+    const res = mockRes();
+    await createItem(
+      {
+        auth: { clientId: 4, userId: 9 },
+        body: itemBody({
+          name: "Soap",
+          make_or_buy: "make",
+          unit_of_measure: "ea",
+          bom_items: [
+            { component_item_id: 2, quantity: 1, unit_of_measure: "widgets" },
+          ],
+        }),
+      },
+      res
+    );
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.error, UNKNOWN_UNIT_ERROR);
+    assert.equal(
+      queries.some((query) => query.sql.includes("INSERT INTO bom_items")),
+      false
+    );
+  });
+
+  it("lets a legacy unit stay when an update does not change it", async () => {
+    const sameQueries = installItemDb("widgets");
+    const same = mockRes();
+    await updateItem(
+      {
+        auth: { clientId: 4, userId: 9 },
+        params: { id: "10" },
+        body: itemBody({ name: "Renamed oil", unit_of_measure: "widgets" }),
+      },
+      same
+    );
+    assert.equal(same.statusCode, 200);
+    const sameUpdate = sameQueries.find((query) =>
+      query.sql.includes("UPDATE items")
+    );
+    assert.equal(sameUpdate.params[0], "Renamed oil");
+    assert.equal(sameUpdate.params[4], "widgets");
+
+    const omittedBody = itemBody({ name: "Renamed again" });
+    delete omittedBody.unit_of_measure;
+    const omittedQueries = installItemDb("  widgets  ");
+    const omitted = mockRes();
+    await updateItem(
+      {
+        auth: { clientId: 4, userId: 9 },
+        params: { id: "10" },
+        body: omittedBody,
+      },
+      omitted
+    );
+    assert.equal(omitted.statusCode, 200);
+    const omittedUpdate = omittedQueries.find((query) =>
+      query.sql.includes("UPDATE items")
+    );
+    assert.equal(omittedUpdate.params[0], "Renamed again");
+    assert.equal(omittedUpdate.params[4], "  widgets  ");
   });
 
   it("stores a canonical unit when an item is updated", async () => {
@@ -267,6 +376,119 @@ describe("unit writes are stored canonically", { concurrency: 1 }, () => {
     // 2 tbsp = 1 fl_oz, times batch quantity 3. Alias spelling does not change that.
     assert.equal(insert.params[2], 3);
     assert.equal(insert.params[5], "tbsp");
+  });
+
+  it("creates a batch when a BOM line still has a legacy unknown unit", async () => {
+    const items = new Map([
+      [
+        1,
+        {
+          id: 1,
+          name: "Soap",
+          make_or_buy: "make",
+          unit_of_measure: "ea",
+          unit_sell_price: 12,
+          default_unit_price: null,
+        },
+      ],
+      [
+        2,
+        {
+          id: 2,
+          name: "Oil",
+          make_or_buy: "buy",
+          unit_of_measure: "widgets",
+          unit_cost: 2,
+          default_unit_price: null,
+        },
+      ],
+    ]);
+    const bomByParent = new Map([
+      [
+        1,
+        [
+          {
+            component_item_id: 2,
+            quantity: 4,
+            bom_unit_of_measure: "widgets",
+            component_name: "Oil",
+            make_or_buy: "buy",
+            unit_of_measure: "widgets",
+          },
+        ],
+      ],
+    ]);
+    const queries = [];
+    pool.connect = async () => ({
+      async query(sql, params = []) {
+        const text = String(sql);
+        queries.push({ sql: text, params });
+        if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK") {
+          return { rows: [] };
+        }
+        if (text.includes("unit_sell_price")) {
+          const row = items.get(params[0]);
+          return {
+            rows: row
+              ? [
+                  {
+                    id: row.id,
+                    make_or_buy: row.make_or_buy,
+                    unit_sell_price: row.unit_sell_price,
+                    default_unit_price: row.default_unit_price,
+                  },
+                ]
+              : [],
+          };
+        }
+        if (text.includes("FROM bom_items")) {
+          return { rows: bomByParent.get(params[0]) ?? [] };
+        }
+        if (text.includes("item_router_phases")) return { rows: [] };
+        if (text.includes("INSERT INTO batch_components")) return { rows: [] };
+        if (text.includes("id = ANY")) {
+          return {
+            rows: (params[1] ?? []).map((id) => {
+              const row = items.get(id);
+              return {
+                id,
+                make_or_buy: row.make_or_buy,
+                unit_cost: row.unit_cost ?? null,
+                default_unit_price: row.default_unit_price ?? null,
+              };
+            }),
+          };
+        }
+        if (text.includes("INSERT INTO batches")) {
+          return { rows: [{ id: 50, item_id: params[1], quantity: params[2] }] };
+        }
+        if (text.includes("FROM items")) {
+          const row = items.get(params[0]);
+          return { rows: row ? [row] : [] };
+        }
+        return { rows: [] };
+      },
+      release() {},
+    });
+    pool.query = async () => ({ rows: [{ id: 50 }] });
+
+    const res = mockRes();
+    await createBatch(
+      {
+        auth: { clientId: 7, userId: 9 },
+        body: { item_id: 1, quantity: 3, sku: "LOT-1" },
+      },
+      res
+    );
+
+    assert.equal(res.statusCode, 201);
+    const insert = queries.find((query) =>
+      query.sql.includes("INSERT INTO batch_components")
+    );
+    assert.equal(insert.params[1], 2);
+    // Same unknown unit on the line and the stock item: quantity is unchanged.
+    assert.equal(insert.params[2], 12);
+    assert.equal(insert.params[5], "widgets");
   });
 });
 
