@@ -2,7 +2,7 @@ import "dotenv/config";
 import cors from "cors";
 import { corsOptions } from "./lib/cors.js";
 import express from "express";
-import { createItem, deleteItem, getItemById, getItemProductionTree, getItems, updateItem } from "./api-functions/items.js";
+import { changeItemUnit, createItem, deleteItem, getItemById, getItemProductionTree, getItems, updateItem } from "./api-functions/items.js";
 import { createBatch, getBatchById, getBatches, updateBatchPhase, cancelBatch, completeBatch } from "./api-functions/batches.js";
 import {
   createRouterPhaseTemplate,
@@ -132,6 +132,12 @@ app.delete(
   deletePurchaseLot
 );
 app.post("/api/items", requireAuth, requireActiveSubscription, createItem);
+app.post(
+  "/api/items/:id/change-unit",
+  requireAuth,
+  requireActiveSubscription,
+  changeItemUnit
+);
 app.put("/api/items/:id", requireAuth, requireActiveSubscription, updateItem);
 app.delete("/api/items/:id", requireAuth, requireActiveSubscription, deleteItem);
 

@@ -226,7 +226,7 @@ describe("unit writes are stored canonically", { concurrency: 1 }, () => {
   });
 
   it("stores a canonical unit when an item is updated", async () => {
-    const queries = installItemDb();
+    const queries = installItemDb("lb");
     const res = mockRes();
     await updateItem(
       {

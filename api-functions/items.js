@@ -4,9 +4,12 @@ import { resolveItemPricing } from "../lib/pricing.js";
 import { syncItemTags } from "../lib/tags.js";
 import {
   bomQuantityInStockUnit,
+  convertQuantity,
+  isCanonicalUnit,
   normalizeUnit,
   resolveBomLineUnit,
   resolveWrittenUnit,
+  unitKindLabel,
   unitsAreCompatible,
 } from "../lib/units.js";
 import { resolveVendorId } from "./vendors.js";
@@ -481,6 +484,17 @@ export async function createItem(req, res) {
   }
 }
 
+function silentUnitChangeError(stored, nextUnit) {
+  const storedText = stored == null ? "" : String(stored).trim();
+  if (!storedText) return null;
+  const previous = normalizeUnit(stored);
+  const next = normalizeUnit(nextUnit);
+  if (previous === next) return null;
+  const fromLabel = previous || storedText;
+  const toLabel = next || "no unit";
+  return `This item is stocked in ${fromLabel}. Saving it as ${toLabel} would leave on-hand quantity, cost, and lots in ${fromLabel}. Change the unit with POST /api/items/:id/change-unit so those amounts convert together.`;
+}
+
 export async function updateItem(req, res) {
   const { id } = req.params;
   const {
@@ -539,6 +553,13 @@ export async function updateItem(req, res) {
     });
     if (!unitResult.ok) {
       throw Object.assign(new Error(unitResult.error), { status: 400 });
+    }
+    const unitChangeError = silentUnitChangeError(
+      existing.rows[0].unit_of_measure,
+      unitResult.unit
+    );
+    if (unitChangeError) {
+      throw Object.assign(new Error(unitChangeError), { status: 400 });
     }
 
     const { rows: existingBom } = await dbClient.query(
@@ -630,6 +651,204 @@ export async function updateItem(req, res) {
       return res.status(409).json({ error: "Vendor part number already exists for this client" });
     }
     res.status(500).json({ error: "Failed to update item" });
+  } finally {
+    dbClient.release();
+  }
+}
+
+function incompatibleUnitChangeError(previous, nextUnit) {
+  const fromKind = unitKindLabel(previous);
+  const toKind = unitKindLabel(nextUnit);
+  const kindDetail =
+    fromKind && toKind
+      ? ` ${previous} is ${fromKind} and ${nextUnit} is ${toKind}.`
+      : "";
+  return `Can't change this item from ${previous} to ${nextUnit}.${kindDetail} Pick another ${fromKind || "compatible"} unit.`;
+}
+
+async function loadItemResponse(db, itemId, clientId) {
+  const { rows } = await db.query(
+    `${itemsSelect} WHERE i.id = $1 AND i.client_id = $2`,
+    [itemId, clientId]
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Convert every quantity stored in this item's stock unit.
+ *
+ * Open batches are refused. Completion posts batch.quantity and
+ * batch_components.quantity_allocated as they were snapshotted, and a
+ * completed batch has already posted. Rewriting either set would change
+ * inventory that was already moved, or change what an in-progress batch
+ * is about to move. Finish or cancel the batch first, then convert the
+ * on-hand quantity once.
+ *
+ * BOM lines keep the unit they were entered in, so the next batch still
+ * converts them into the new stock unit. A blank component line is stamped
+ * with the previous stock unit so that number is not re-read in the new unit.
+ */
+export async function changeItemUnit(req, res) {
+  const itemId = Number(req.params.id);
+  if (!Number.isInteger(itemId) || itemId <= 0) {
+    return res.status(400).json({ error: "Invalid item id" });
+  }
+
+  const unitResult = resolveWrittenUnit(req.body?.unit_of_measure);
+  if (!unitResult.ok) {
+    return res.status(400).json({ error: unitResult.error });
+  }
+  if (!unitResult.unit) {
+    return res.status(400).json({
+      error: "Pick a unit to change to, like oz, lb, fl oz, or mL.",
+    });
+  }
+  const nextUnit = unitResult.unit;
+  const { clientId } = req.auth;
+
+  const dbClient = await pool.connect();
+  try {
+    await dbClient.query("BEGIN");
+
+    const existing = await dbClient.query(
+      `SELECT id, unit_of_measure
+       FROM items
+       WHERE id = $1 AND client_id = $2
+       FOR UPDATE`,
+      [itemId, clientId]
+    );
+    if (existing.rows.length === 0) {
+      await dbClient.query("ROLLBACK");
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    const storedRaw = existing.rows[0].unit_of_measure;
+    const storedText = storedRaw == null ? "" : String(storedRaw).trim();
+    const previous = normalizeUnit(storedRaw);
+    if (!storedText || !previous) {
+      await dbClient.query("ROLLBACK");
+      return res.status(400).json({
+        error:
+          "This item doesn't have a unit yet. Save a unit on the item first; there's nothing to convert.",
+      });
+    }
+    if (!isCanonicalUnit(previous)) {
+      await dbClient.query("ROLLBACK");
+      return res.status(400).json({
+        error: `This item's unit "${storedText}" isn't a known unit, so quantities can't be converted.`,
+      });
+    }
+
+    if (previous !== nextUnit) {
+      if (!unitsAreCompatible(previous, nextUnit)) {
+        await dbClient.query("ROLLBACK");
+        return res.status(400).json({
+          error: incompatibleUnitChangeError(previous, nextUnit),
+        });
+      }
+
+      const factor = convertQuantity(1, previous, nextUnit);
+      if (factor == null || !Number.isFinite(factor) || factor <= 0) {
+        await dbClient.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Can't convert ${previous} to ${nextUnit}.`,
+        });
+      }
+
+      const { rows: openBatches } = await dbClient.query(
+        `SELECT b.id
+         FROM batches b
+         WHERE b.client_id = $1
+           AND b.status IN ('planned', 'in_progress')
+           AND (
+             b.item_id = $2
+             OR EXISTS (
+               SELECT 1
+               FROM batch_components bc
+               WHERE bc.batch_id = b.id
+                 AND bc.item_id = $2
+             )
+           )
+         FOR UPDATE OF b`,
+        [clientId, itemId]
+      );
+      if (openBatches.length > 0) {
+        await dbClient.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Finish or cancel open batches that use this item before changing its unit from ${previous} to ${nextUnit}. An open batch still has quantities in ${previous}.`,
+        });
+      }
+
+      await dbClient.query(
+        `UPDATE inventory
+         SET quantity = quantity * $1::numeric,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE client_id = $2 AND item_id = $3`,
+        [factor, clientId, itemId]
+      );
+      await dbClient.query(
+        `UPDATE item_inventory_goals
+         SET goal_min = goal_min * $1::numeric,
+             goal_max = goal_max * $1::numeric,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE client_id = $2 AND item_id = $3`,
+        [factor, clientId, itemId]
+      );
+      await dbClient.query(
+        `UPDATE purchase_lots
+         SET quantity = quantity * $1::numeric,
+             unit_cost = unit_cost / $1::numeric
+         WHERE client_id = $2 AND item_id = $3`,
+        [factor, clientId, itemId]
+      );
+      await dbClient.query(
+        `UPDATE bom_items
+         SET unit_of_measure = $1
+         WHERE component_item_id = $2
+           AND (unit_of_measure IS NULL OR btrim(unit_of_measure) = '')`,
+        [previous, itemId]
+      );
+      await dbClient.query(
+        `UPDATE items
+         SET unit_of_measure = $1,
+             unit_cost = CASE
+               WHEN unit_cost IS NULL THEN NULL
+               ELSE unit_cost / $2::numeric
+             END,
+             unit_sell_price = CASE
+               WHEN unit_sell_price IS NULL THEN NULL
+               ELSE unit_sell_price / $2::numeric
+             END,
+             default_unit_price = CASE
+               WHEN default_unit_price IS NULL THEN NULL
+               ELSE default_unit_price / $2::numeric
+             END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3 AND client_id = $4`,
+        [nextUnit, factor, itemId, clientId]
+      );
+    } else if (String(storedRaw) !== nextUnit) {
+      await dbClient.query(
+        `UPDATE items
+         SET unit_of_measure = $1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2 AND client_id = $3`,
+        [nextUnit, itemId, clientId]
+      );
+    }
+
+    const item = await loadItemResponse(dbClient, itemId, clientId);
+    if (!item) {
+      await dbClient.query("ROLLBACK");
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    await dbClient.query("COMMIT");
+    res.json(item);
+  } catch (err) {
+    await dbClient.query("ROLLBACK");
+    console.error(err);
+    res.status(500).json({ error: "Failed to change item unit" });
   } finally {
     dbClient.release();
   }
