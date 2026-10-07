@@ -854,6 +854,17 @@ export async function changeItemUnit(req, res) {
   }
 }
 
+function itemInUseError(recipes, batches) {
+  const parts = [];
+  if (recipes.length > 0) {
+    parts.push(`Used in the recipe for: ${recipes.join(", ")}`);
+  }
+  if (batches.length > 0) {
+    parts.push(`Used in active batch: ${batches.join(", ")}`);
+  }
+  return parts.join(". ");
+}
+
 export async function deleteItem(req, res) {
   const { id } = req.params;
   const { clientId } = req.auth;
@@ -862,12 +873,48 @@ export async function deleteItem(req, res) {
     await dbClient.query("BEGIN");
 
     const owned = await dbClient.query(
-      "SELECT id FROM items WHERE id = $1 AND client_id = $2",
+      `SELECT id FROM items WHERE id = $1 AND client_id = $2 FOR UPDATE`,
       [id, clientId]
     );
     if (owned.rows.length === 0) {
       await dbClient.query("ROLLBACK");
       return res.status(404).json({ error: "Item not found" });
+    }
+
+    const { rows: recipeRows } = await dbClient.query(
+      `SELECT DISTINCT p.name
+       FROM bom_items b
+       JOIN items p ON p.id = b.parent_item_id
+       WHERE b.component_item_id = $1
+         AND p.client_id = $2
+         AND b.parent_item_id <> $1
+       ORDER BY p.name`,
+      [id, clientId]
+    );
+    const { rows: batchRows } = await dbClient.query(
+      `SELECT DISTINCT COALESCE(NULLIF(btrim(b.sku), ''), finished.name, 'Batch ' || b.id::text) AS label
+       FROM batches b
+       JOIN items finished ON finished.id = b.item_id
+       WHERE b.client_id = $2
+         AND b.status IN ('planned', 'in_progress')
+         AND (
+           b.item_id = $1
+           OR EXISTS (
+             SELECT 1
+             FROM batch_components bc
+             WHERE bc.batch_id = b.id
+               AND bc.item_id = $1
+           )
+         )
+       ORDER BY label`,
+      [id, clientId]
+    );
+
+    const recipes = recipeRows.map((row) => row.name).filter(Boolean);
+    const batches = batchRows.map((row) => row.label).filter(Boolean);
+    if (recipes.length > 0 || batches.length > 0) {
+      await dbClient.query("ROLLBACK");
+      return res.status(409).json({ error: itemInUseError(recipes, batches) });
     }
 
     await dbClient.query(
