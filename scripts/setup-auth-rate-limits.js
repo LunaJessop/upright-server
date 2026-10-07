@@ -43,7 +43,7 @@ async function main() {
     if (!(await tableExists(client, "auth_rate_limits"))) {
       await client.query(`
         CREATE TABLE auth_rate_limits (
-          action TEXT NOT NULL CHECK (action IN ('login', 'register')),
+          action TEXT NOT NULL CHECK (action IN ('login', 'register', 'forgot_password')),
           scope TEXT NOT NULL CHECK (scope IN ('ip', 'email')),
           subject TEXT NOT NULL CHECK (char_length(subject) BETWEEN 1 AND 320),
           window_start TIMESTAMPTZ NOT NULL,
@@ -55,6 +55,31 @@ async function main() {
       console.log("Created auth_rate_limits table");
     } else {
       console.log("auth_rate_limits table already exists");
+      await client.query(`
+        DO $$
+        DECLARE
+          r record;
+        BEGIN
+          FOR r IN
+            SELECT con.conname
+            FROM pg_constraint con
+            JOIN pg_class rel ON rel.oid = con.conrelid
+            JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+            WHERE nsp.nspname = 'public'
+              AND rel.relname = 'auth_rate_limits'
+              AND con.contype = 'c'
+              AND pg_get_constraintdef(con.oid) ILIKE '%action%'
+          LOOP
+            EXECUTE format('ALTER TABLE auth_rate_limits DROP CONSTRAINT %I', r.conname);
+          END LOOP;
+        END $$
+      `);
+      await client.query(`
+        ALTER TABLE auth_rate_limits
+          ADD CONSTRAINT auth_rate_limits_action_check
+          CHECK (action IN ('login', 'register', 'forgot_password'))
+      `);
+      console.log("Updated auth_rate_limits action check");
     }
 
     await client.query("COMMIT");

@@ -17,6 +17,7 @@ import {
   inspectAuthRateLimit,
   rateLimitErrorMessage,
 } from "../lib/authRateLimit.js";
+import { sendEmail } from "../lib/email/index.js";
 
 // Same cost factor as real password hashes so an unknown email is not a fast oracle.
 const DUMMY_PASSWORD_HASH =
@@ -239,6 +240,18 @@ export async function register(req, res) {
     return res.status(500).json({ error: "Registration failed" });
   } finally {
     db.release();
+  }
+
+  try {
+    await sendEmail({
+      to: normalizedEmail,
+      template: "welcome",
+      data: { name: trimmedName, companyName: trimmedCompany },
+      clientId,
+      userId: userRow.id,
+    });
+  } catch (err) {
+    console.error("Welcome email failed:", err);
   }
 
   // Optionally create Stripe customer now; plan + Checkout happen on /register/plan.

@@ -6,6 +6,7 @@ import {
   liveSubscriptionStatusSqlList,
   periodEndFromSubscription,
 } from "../lib/billing.js";
+import { sendEmail } from "../lib/email/index.js";
 
 function subscriptionGuard(paramIndex) {
   return `(
@@ -22,8 +23,60 @@ function subscriptionGuard(paramIndex) {
  */
 async function updateClientSubscription(clientId, sql, params, subscription) {
   const result = await pool.query(sql, params);
-  if (result.rows?.length > 0) return;
+  if (result.rows?.length > 0) return true;
   await handleUnclaimedSubscription(clientId, subscription);
+  return false;
+}
+
+function formatMoney(amountCents, currency = "usd") {
+  const cents = Number(amountCents);
+  if (!Number.isFinite(cents) || cents <= 0) return null;
+  const code = String(currency || "usd").toUpperCase();
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: code,
+    }).format(cents / 100);
+  } catch {
+    return `${(cents / 100).toFixed(2)} ${code}`;
+  }
+}
+
+async function loadBillingRecipient(clientId) {
+  const { rows } = await pool.query(
+    `SELECT
+       u.id AS user_id,
+       u.email,
+       u.name,
+       c.name AS company_name
+     FROM clients c
+     JOIN users u ON u.client_id = c.id AND u.active = TRUE
+     WHERE c.id = $1
+     ORDER BY CASE u.role WHEN 'founder' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, u.id
+     LIMIT 1`,
+    [clientId]
+  );
+  return rows[0] ?? null;
+}
+
+async function notifyBilling(clientId, template, data) {
+  try {
+    const recipient = await loadBillingRecipient(clientId);
+    if (!recipient?.email) return;
+    await sendEmail({
+      to: recipient.email,
+      template,
+      data: {
+        name: recipient.name,
+        companyName: recipient.company_name,
+        ...data,
+      },
+      clientId,
+      userId: recipient.user_id,
+    });
+  } catch (err) {
+    console.error("Billing email failed:", err);
+  }
 }
 
 async function handleUnclaimedSubscription(clientId, subscription) {
@@ -95,7 +148,7 @@ async function markActive(clientId, subscription) {
     process.env.STRIPE_PRICE_ID?.trim() ??
     null;
 
-  await updateClientSubscription(
+  return updateClientSubscription(
     clientId,
     `UPDATE clients SET
        stripe_subscription_id = COALESCE($2, stripe_subscription_id),
@@ -121,7 +174,7 @@ async function syncSubscription(subscription) {
   const clientId = await findClientIdFromSubscription(subscription);
   if (!clientId) {
     console.warn("No client for subscription", subscription?.id);
-    return;
+    return { clientId: null, saved: false };
   }
 
   const status = subscription.status;
@@ -129,12 +182,12 @@ async function syncSubscription(subscription) {
   const periodEnd = periodEndFromSubscription(subscription);
 
   if (status === "active" || status === "trialing") {
-    await markActive(clientId, subscription);
-    return;
+    const saved = await markActive(clientId, subscription);
+    return { clientId, saved };
   }
 
   if (status === "past_due" || status === "unpaid") {
-    await updateClientSubscription(
+    const saved = await updateClientSubscription(
       clientId,
       `UPDATE clients SET
          stripe_subscription_id = $2,
@@ -149,11 +202,11 @@ async function syncSubscription(subscription) {
       [clientId, subscription.id, priceId, status, periodEnd],
       subscription
     );
-    return;
+    return { clientId, saved };
   }
 
   if (status === "canceled" || status === "incomplete_expired") {
-    await updateClientSubscription(
+    const saved = await updateClientSubscription(
       clientId,
       `UPDATE clients SET
          stripe_subscription_id = $2,
@@ -168,7 +221,10 @@ async function syncSubscription(subscription) {
       [clientId, subscription.id, priceId, periodEnd],
       { ...subscription, status: "canceled" }
     );
+    return { clientId, saved };
   }
+
+  return { clientId, saved: false };
 }
 
 async function handleCheckoutCompleted(session) {
@@ -227,7 +283,7 @@ async function handleInvoicePaymentFailed(invoice) {
       ? invoice.subscription
       : invoice.subscription?.id ?? null;
 
-  await updateClientSubscription(
+  const saved = await updateClientSubscription(
     clientId,
     `UPDATE clients SET
        subscription_status = 'past_due',
@@ -244,6 +300,22 @@ async function handleInvoicePaymentFailed(invoice) {
       latest_invoice: invoice.id ?? null,
     }
   );
+  if (!saved) return;
+  await notifyBilling(clientId, "payment_failed", {
+    amount: formatMoney(invoice.amount_due, invoice.currency),
+  });
+}
+
+async function handleInvoicePaid(invoice) {
+  const clientId = await findClientIdFromCustomer(invoice.customer);
+  if (!clientId) return;
+  const amount = formatMoney(invoice.amount_paid, invoice.currency);
+  if (!amount) return;
+  await notifyBilling(clientId, "payment_succeeded", {
+    amount,
+    invoiceNumber: invoice.number ?? null,
+    receiptUrl: invoice.hosted_invoice_url ?? null,
+  });
 }
 
 export async function stripeWebhook(req, res) {
@@ -272,11 +344,18 @@ export async function stripeWebhook(req, res) {
       case "customer.subscription.updated":
         await syncSubscription(event.data.object);
         break;
-      case "customer.subscription.deleted":
-        await syncSubscription({
+      case "customer.subscription.deleted": {
+        const outcome = await syncSubscription({
           ...event.data.object,
           status: "canceled",
         });
+        if (outcome.saved) {
+          await notifyBilling(outcome.clientId, "subscription_canceled", {});
+        }
+        break;
+      }
+      case "invoice.paid":
+        await handleInvoicePaid(event.data.object);
         break;
       case "invoice.payment_failed":
         await handleInvoicePaymentFailed(event.data.object);
