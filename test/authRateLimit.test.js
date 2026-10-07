@@ -54,6 +54,22 @@ describe("auth rate limit policy", () => {
     assert.equal(AUTH_RATE_LIMITS.register.email.windowMs, 60 * 60 * 1000);
     assert.equal(AUTH_RATE_LIMITS.register.ip.limit, 10);
     assert.equal(AUTH_RATE_LIMITS.register.ip.windowMs, 60 * 60 * 1000);
+    assert.equal(
+      AUTH_RATE_LIMITS.forgot_password.email.limit,
+      AUTH_RATE_LIMITS.login.email.limit
+    );
+    assert.equal(
+      AUTH_RATE_LIMITS.forgot_password.email.windowMs,
+      AUTH_RATE_LIMITS.login.email.windowMs
+    );
+    assert.equal(
+      AUTH_RATE_LIMITS.forgot_password.ip.limit,
+      AUTH_RATE_LIMITS.login.ip.limit
+    );
+    assert.equal(
+      AUTH_RATE_LIMITS.forgot_password.ip.windowMs,
+      AUTH_RATE_LIMITS.login.ip.windowMs
+    );
   });
 
   it("describes the wait in minutes for the response body", () => {
