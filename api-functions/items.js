@@ -9,11 +9,19 @@ import {
   normalizeUnit,
   resolveBomLineUnit,
   resolveWrittenUnit,
-  unitKindLabel,
   unitsAreCompatible,
 } from "../lib/units.js";
 import { resolveVendorId } from "./vendors.js";
 import { parseEstimatedMinutes } from "../lib/estimatedMinutes.js";
+import {
+  buildCrossKindPreview,
+  conversionCounts,
+  conversionRequired,
+  isDryRun,
+  parseConversionFactor,
+  quantityInStockUnit,
+  spokenUnit,
+} from "../lib/crossKindUnit.js";
 
 const itemsSelect = `
   SELECT i.*,
@@ -658,22 +666,311 @@ export async function updateItem(req, res) {
   }
 }
 
-function incompatibleUnitChangeError(previous, nextUnit) {
-  const fromKind = unitKindLabel(previous);
-  const toKind = unitKindLabel(nextUnit);
-  const kindDetail =
-    fromKind && toKind
-      ? ` ${previous} is ${fromKind} and ${nextUnit} is ${toKind}.`
-      : "";
-  return `Can't change this item from ${previous} to ${nextUnit}.${kindDetail} Pick another ${fromKind || "compatible"} unit.`;
-}
-
 async function loadItemResponse(db, itemId, clientId) {
   const { rows } = await db.query(
     `${itemsSelect} WHERE i.id = $1 AND i.client_id = $2`,
     [itemId, clientId]
   );
   return rows[0] ?? null;
+}
+
+function numOrNull(value) {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function loadCrossKindSnapshot(db, clientId, itemId, prices) {
+  const inventory = await db.query(
+    `SELECT quantity
+     FROM inventory
+     WHERE client_id = $1 AND item_id = $2
+     FOR UPDATE`,
+    [clientId, itemId]
+  );
+  const goals = await db.query(
+    `SELECT goal_min, goal_max
+     FROM item_inventory_goals
+     WHERE client_id = $1 AND item_id = $2
+     FOR UPDATE`,
+    [clientId, itemId]
+  );
+  const lots = await db.query(
+    `SELECT id, lot_number, quantity, unit_cost
+     FROM purchase_lots
+     WHERE client_id = $1 AND item_id = $2
+     ORDER BY id
+     FOR UPDATE`,
+    [clientId, itemId]
+  );
+  const ingredients = await db.query(
+    `SELECT b.parent_item_id, p.name AS parent_name, b.quantity, b.unit_of_measure
+     FROM bom_items b
+     JOIN items p ON p.id = b.parent_item_id AND p.client_id = $2
+     WHERE b.component_item_id = $1
+     ORDER BY p.name, b.parent_item_id
+     FOR UPDATE OF b`,
+    [itemId, clientId]
+  );
+  const ownRecipe = await db.query(
+    `SELECT b.component_item_id, c.name AS component_name, b.quantity, b.unit_of_measure
+     FROM bom_items b
+     JOIN items c ON c.id = b.component_item_id AND c.client_id = $2
+     WHERE b.parent_item_id = $1
+     ORDER BY c.name, b.component_item_id
+     FOR UPDATE OF b`,
+    [itemId, clientId]
+  );
+  const finished = await db.query(
+    `SELECT id, sku, status, quantity, projected_unit_cost, projected_unit_sell
+     FROM batches
+     WHERE client_id = $1 AND item_id = $2
+     ORDER BY id
+     FOR UPDATE`,
+    [clientId, itemId]
+  );
+  const components = await db.query(
+    `SELECT bc.id, bc.batch_id, b.sku, b.status,
+            bc.quantity_allocated, bc.unit_of_measure, bc.unit_cost_snapshot
+     FROM batch_components bc
+     JOIN batches b ON b.id = bc.batch_id AND b.client_id = $2
+     WHERE bc.item_id = $1
+     ORDER BY b.id, bc.id
+     FOR UPDATE OF bc`,
+    [itemId, clientId]
+  );
+
+  const goalRow = goals.rows[0] ?? null;
+  return {
+    onHand: inventory.rows[0]?.quantity ?? null,
+    goals: goalRow
+      ? { goalMin: goalRow.goal_min, goalMax: goalRow.goal_max }
+      : null,
+    prices: {
+      unitCost: prices?.unit_cost ?? null,
+      unitSellPrice: prices?.unit_sell_price ?? null,
+      defaultUnitPrice: prices?.default_unit_price ?? null,
+    },
+    lots: lots.rows.map((row) => ({
+      id: row.id,
+      lotNumber: row.lot_number,
+      quantity: row.quantity,
+      unitCost: row.unit_cost,
+    })),
+    ingredientLines: ingredients.rows.map((row) => ({
+      parentItemId: row.parent_item_id,
+      parentName: row.parent_name,
+      quantity: row.quantity,
+      unit: row.unit_of_measure,
+    })),
+    ownRecipeLines: ownRecipe.rows.map((row) => ({
+      componentItemId: row.component_item_id,
+      componentName: row.component_name,
+      quantity: row.quantity,
+      unit: row.unit_of_measure,
+    })),
+    finishedBatches: finished.rows.map((row) => ({
+      id: row.id,
+      sku: row.sku,
+      status: row.status,
+      quantity: row.quantity,
+    })),
+    componentLines: components.rows.map((row) => ({
+      id: row.id,
+      batchId: row.batch_id,
+      sku: row.sku,
+      status: row.status,
+      quantity: row.quantity_allocated,
+      unit: row.unit_of_measure,
+      unitCost: row.unit_cost_snapshot,
+    })),
+  };
+}
+
+async function writeUnitOnly(db, itemId, clientId, nextUnit) {
+  await db.query(
+    `UPDATE items
+     SET unit_of_measure = $1,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2 AND client_id = $3`,
+    [nextUnit, itemId, clientId]
+  );
+}
+
+async function writeCrossKindConversion(db, clientId, itemId, fromUnit, nextUnit, factor, snapshot) {
+  await db.query(
+    `UPDATE inventory
+     SET quantity = quantity / $1::numeric,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE client_id = $2 AND item_id = $3`,
+    [factor, clientId, itemId]
+  );
+  await db.query(
+    `UPDATE item_inventory_goals
+     SET goal_min = goal_min / $1::numeric,
+         goal_max = goal_max / $1::numeric,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE client_id = $2 AND item_id = $3`,
+    [factor, clientId, itemId]
+  );
+  await db.query(
+    `UPDATE purchase_lots
+     SET quantity = quantity / $1::numeric,
+         unit_cost = unit_cost * $1::numeric
+     WHERE client_id = $2 AND item_id = $3`,
+    [factor, clientId, itemId]
+  );
+  await db.query(
+    `UPDATE items
+     SET unit_of_measure = $1,
+         unit_cost = CASE
+           WHEN unit_cost IS NULL THEN NULL
+           ELSE unit_cost * $2::numeric
+         END,
+         unit_sell_price = CASE
+           WHEN unit_sell_price IS NULL THEN NULL
+           ELSE unit_sell_price * $2::numeric
+         END,
+         default_unit_price = CASE
+           WHEN default_unit_price IS NULL THEN NULL
+           ELSE default_unit_price * $2::numeric
+         END,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $3 AND client_id = $4`,
+    [nextUnit, factor, itemId, clientId]
+  );
+
+  for (const line of snapshot.ingredientLines) {
+    const before = quantityInStockUnit(line.quantity, line.unit, fromUnit);
+    const after = before == null ? null : before / factor;
+    await db.query(
+      `UPDATE bom_items b
+       SET quantity = $1,
+           unit_of_measure = $2
+       WHERE b.component_item_id = $3
+         AND b.parent_item_id = $4
+         AND b.quantity = $5
+         AND EXISTS (
+           SELECT 1 FROM items p
+           WHERE p.id = b.parent_item_id AND p.client_id = $6
+         )`,
+      [after, nextUnit, itemId, line.parentItemId, line.quantity, clientId]
+    );
+  }
+
+  for (const line of snapshot.ownRecipeLines) {
+    const before = numOrNull(line.quantity);
+    const after = before == null ? null : before * factor;
+    await db.query(
+      `UPDATE bom_items b
+       SET quantity = $1
+       WHERE b.parent_item_id = $2
+         AND b.component_item_id = $3
+         AND b.quantity = $4
+         AND EXISTS (
+           SELECT 1 FROM items parent
+           WHERE parent.id = b.parent_item_id AND parent.client_id = $5
+         )`,
+      [after, itemId, line.componentItemId, line.quantity, clientId]
+    );
+  }
+
+  await db.query(
+    `UPDATE batches
+     SET quantity = quantity / $1::numeric,
+         projected_unit_cost = CASE
+           WHEN projected_unit_cost IS NULL THEN NULL
+           ELSE projected_unit_cost * $1::numeric
+         END,
+         projected_unit_sell = CASE
+           WHEN projected_unit_sell IS NULL THEN NULL
+           ELSE projected_unit_sell * $1::numeric
+         END,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE client_id = $2 AND item_id = $3`,
+    [factor, clientId, itemId]
+  );
+  await db.query(
+    `UPDATE batch_components bc
+     SET quantity_allocated = quantity_allocated / $1::numeric,
+         unit_cost_snapshot = CASE
+           WHEN unit_cost_snapshot IS NULL THEN NULL
+           ELSE unit_cost_snapshot * $1::numeric
+         END,
+         unit_of_measure = $2
+     WHERE bc.item_id = $3
+       AND EXISTS (
+         SELECT 1 FROM batches b
+         WHERE b.id = bc.batch_id AND b.client_id = $4
+       )`,
+    [factor, nextUnit, itemId, clientId]
+  );
+}
+
+async function respondCrossKindUnitChange(db, res, input) {
+  const { clientId, itemId, previous, nextUnit, prices, body } = input;
+  const snapshot = await loadCrossKindSnapshot(db, clientId, itemId, prices);
+  const counts = conversionCounts(snapshot);
+  const required = conversionRequired(snapshot);
+  const parsed = parseConversionFactor(body?.factor);
+  const dryRun = isDryRun(body?.dryRun);
+
+  if (parsed.state === "invalid") {
+    await db.query("ROLLBACK");
+    return res.status(400).json({
+      error: "Conversion factor must be a finite number greater than zero.",
+      code: "INVALID_CONVERSION_FACTOR",
+      fromUnit: previous,
+      toUnit: nextUnit,
+      counts,
+    });
+  }
+
+  if (required && parsed.state === "missing") {
+    await db.query("ROLLBACK");
+    return res.status(400).json({
+      error: `How many ${spokenUnit(previous)} is 1 ${spokenUnit(nextUnit)}?`,
+      code: "CONVERSION_FACTOR_REQUIRED",
+      fromUnit: previous,
+      toUnit: nextUnit,
+      counts,
+    });
+  }
+
+  const factor = required ? parsed.factor : null;
+  const preview = buildCrossKindPreview({
+    fromUnit: previous,
+    toUnit: nextUnit,
+    factor,
+    snapshot,
+  });
+
+  if (dryRun) {
+    await db.query("ROLLBACK");
+    return res.json(preview);
+  }
+
+  if (!required) {
+    await writeUnitOnly(db, itemId, clientId, nextUnit);
+  } else {
+    await writeCrossKindConversion(
+      db,
+      clientId,
+      itemId,
+      previous,
+      nextUnit,
+      factor,
+      snapshot
+    );
+  }
+
+  const item = await loadItemResponse(db, itemId, clientId);
+  if (!item) {
+    await db.query("ROLLBACK");
+    return res.status(404).json({ error: "Item not found" });
+  }
+  await db.query("COMMIT");
+  return res.json(item);
 }
 
 /**
@@ -689,6 +986,10 @@ async function loadItemResponse(db, itemId, clientId) {
  * BOM lines keep the unit they were entered in, so the next batch still
  * converts them into the new stock unit. A blank component line is stamped
  * with the previous stock unit so that number is not re-read in the new unit.
+ *
+ * A different kind (fl oz to each) does not use this path. That change is
+ * allowed with no factor when nothing is stored in the old unit. Otherwise
+ * the caller supplies how many old units make one new unit.
  */
 export async function changeItemUnit(req, res) {
   const itemId = Number(req.params.id);
@@ -713,7 +1014,7 @@ export async function changeItemUnit(req, res) {
     await dbClient.query("BEGIN");
 
     const existing = await dbClient.query(
-      `SELECT id, unit_of_measure
+      `SELECT id, unit_of_measure, unit_cost, unit_sell_price, default_unit_price
        FROM items
        WHERE id = $1 AND client_id = $2
        FOR UPDATE`,
@@ -743,10 +1044,15 @@ export async function changeItemUnit(req, res) {
 
     if (previous !== nextUnit) {
       if (!unitsAreCompatible(previous, nextUnit)) {
-        await dbClient.query("ROLLBACK");
-        return res.status(400).json({
-          error: incompatibleUnitChangeError(previous, nextUnit),
+        await respondCrossKindUnitChange(dbClient, res, {
+          clientId,
+          itemId,
+          previous,
+          nextUnit,
+          prices: existing.rows[0],
+          body: req.body ?? {},
         });
+        return;
       }
 
       const factor = convertQuantity(1, previous, nextUnit);
