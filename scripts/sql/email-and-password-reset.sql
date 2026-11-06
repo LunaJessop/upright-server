@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS password_reset_tokens (
 CREATE INDEX IF NOT EXISTS password_reset_tokens_user_id_idx
   ON password_reset_tokens (user_id);
 
--- Let forgot-password use the same rate-limit table as login.
+-- Let forgot-password and reset-password use the same rate-limit table as login.
+-- Re-run this block when auth_rate_limits already exists so the action check
+-- includes reset_password. Until then, reset-password is not limited.
 -- No-op when auth_rate_limits has not been created yet.
 DO $$
 DECLARE
@@ -55,7 +57,7 @@ BEGIN
 
   ALTER TABLE auth_rate_limits
     ADD CONSTRAINT auth_rate_limits_action_check
-    CHECK (action IN ('login', 'register', 'forgot_password'));
+    CHECK (action IN ('login', 'register', 'forgot_password', 'reset_password'));
 END $$;
 
 SELECT

@@ -269,6 +269,7 @@ describe("email sql", () => {
     assert.match(sql, /CREATE TABLE IF NOT EXISTS password_reset_tokens/);
     assert.match(sql, /token_hash TEXT NOT NULL UNIQUE/);
     assert.match(sql, /forgot_password/);
+    assert.match(sql, /reset_password/);
     const statements = sql
       .split(/;\s*\n/)
       .map((part) => part.trim())

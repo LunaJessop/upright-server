@@ -144,7 +144,16 @@ export async function resetPassword(req, res) {
     return res.status(400).json({ error: RESET_PASSWORD_INVALID_MESSAGE });
   }
 
-  const passwordHash = await bcrypt.hash(password, 10);
+  const rateLimit = {
+    action: "reset_password",
+    ip: clientIp(req),
+  };
+  const gate = await inspectAuthRateLimit(dbQuery, rateLimit);
+  if (gate.limited) {
+    return sendRateLimited(res, gate.retryAfterSeconds);
+  }
+  await consumeAuthRateLimit(dbQuery, rateLimit);
+
   const db = await pool.connect();
   try {
     await db.query("BEGIN");
@@ -170,6 +179,7 @@ export async function resetPassword(req, res) {
       return res.status(400).json({ error: RESET_PASSWORD_INVALID_MESSAGE });
     }
 
+    const passwordHash = await bcrypt.hash(password, 10);
     await db.query(
       `UPDATE users
        SET password_hash = $1,

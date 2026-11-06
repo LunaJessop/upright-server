@@ -70,6 +70,15 @@ describe("auth rate limit policy", () => {
       AUTH_RATE_LIMITS.forgot_password.ip.windowMs,
       AUTH_RATE_LIMITS.login.ip.windowMs
     );
+    assert.equal(
+      AUTH_RATE_LIMITS.reset_password.ip.limit,
+      AUTH_RATE_LIMITS.login.ip.limit
+    );
+    assert.equal(
+      AUTH_RATE_LIMITS.reset_password.ip.windowMs,
+      AUTH_RATE_LIMITS.login.ip.windowMs
+    );
+    assert.equal(AUTH_RATE_LIMITS.reset_password.email, undefined);
   });
 
   it("describes the wait in minutes for the response body", () => {
@@ -105,6 +114,10 @@ describe("auth rate limit policy", () => {
     assert.match(source, /PRIMARY KEY \(action, scope, subject\)/);
     assert.match(source, /window_start TIMESTAMPTZ NOT NULL/);
     assert.match(source, /attempts INTEGER NOT NULL/);
+    assert.match(
+      source,
+      /action IN \('login', 'register', 'forgot_password', 'reset_password'\)/
+    );
   });
 });
 
@@ -184,6 +197,27 @@ describe("auth rate limit counters", { concurrency: 1 }, () => {
       ip: "203.0.113.11",
       email: "new-person@example.com",
       now,
+    });
+    assert.equal(otherIp.limited, false);
+  });
+
+  it("blocks reset-password for one IP after the same window as login", async () => {
+    const db = createMemoryQuery();
+    const query = db.query.bind(db);
+    const now = new Date("2026-01-01T00:00:00.000Z");
+    const input = { action: "reset_password", ip: "203.0.113.40", now };
+
+    for (let n = 0; n < AUTH_RATE_LIMITS.reset_password.ip.limit; n += 1) {
+      const gate = await inspectAuthRateLimit(query, input);
+      assert.equal(gate.limited, false);
+      await consumeAuthRateLimit(query, input);
+    }
+
+    const blocked = await inspectAuthRateLimit(query, input);
+    assert.equal(blocked.limited, true);
+    const otherIp = await inspectAuthRateLimit(query, {
+      ...input,
+      ip: "203.0.113.41",
     });
     assert.equal(otherIp.limited, false);
   });
