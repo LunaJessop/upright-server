@@ -38,12 +38,12 @@ const batchesSelect = `
         'unit_of_measure', COALESCE(bc.unit_of_measure, ci.unit_of_measure))
         ORDER BY ci.name)
        FROM batch_components bc
-       JOIN items ci ON ci.id = bc.item_id
+       JOIN items ci ON ci.id = bc.item_id AND ci.client_id = b.client_id
        WHERE bc.batch_id = b.id),
       '[]'::json
     ) AS components
   FROM batches b
-  JOIN items i ON i.id = b.item_id
+  JOIN items i ON i.id = b.item_id AND i.client_id = b.client_id
 `;
 
 const VALID_PHASE_STATUSES = ["pending", "in_progress", "complete", "skipped"];
@@ -357,8 +357,8 @@ export async function createBatch(req, res) {
     await dbClient.query("COMMIT");
 
     const { rows } = await pool.query(
-      `${batchesSelect} WHERE b.id = $1`,
-      [batch.id]
+      `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
+      [batch.id, clientId]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -515,9 +515,9 @@ export async function completeBatch(req, res) {
     const { rows: components } = await dbClient.query(
       `SELECT bc.item_id, bc.quantity_allocated, i.make_or_buy
        FROM batch_components bc
-       JOIN items i ON i.id = bc.item_id
+       JOIN items i ON i.id = bc.item_id AND i.client_id = $2
        WHERE bc.batch_id = $1`,
-      [id]
+      [id, clientId]
     );
 
     for (const component of components) {
@@ -626,8 +626,8 @@ export async function updateBatchPhase(req, res) {
     await dbClient.query("COMMIT");
 
     const { rows: batchRows } = await pool.query(
-      `${batchesSelect} WHERE b.id = $1`,
-      [batchId]
+      `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
+      [batchId, clientId]
     );
     res.json(batchRows[0]);
   } catch (err) {
