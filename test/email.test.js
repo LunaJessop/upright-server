@@ -6,15 +6,23 @@ process.env.DATABASE_URL ??=
   "postgres://user:pass@127.0.0.1:5432/upright_email_test";
 process.env.FRONTEND_URL = "https://app.example.com";
 delete process.env.RESEND_API_KEY;
+delete process.env.GMAIL_USER;
+delete process.env.GMAIL_APP_PASSWORD;
+delete process.env.SUPPORT_EMAIL;
 
 const { pool } = await import("../lib/db.js");
 const { EMAIL_FOOTER } = await import("../lib/email/layout.js");
 const {
   emailFromAddress,
+  gmailFromAddress,
+  gmailTransportOptions,
   renderTemplate,
   resetEmailForTests,
+  selectEmailProvider,
   sendEmail,
+  setNodemailerForTests,
   setResendForTests,
+  supportEmailAddress,
   templates,
 } = await import("../lib/email/index.js");
 
@@ -108,6 +116,8 @@ describe("sendEmail", { concurrency: 1 }, () => {
   it("logs and skips when RESEND_API_KEY is missing", async () => {
     resetEmailForTests();
     delete process.env.RESEND_API_KEY;
+    delete process.env.GMAIL_USER;
+    delete process.env.GMAIL_APP_PASSWORD;
     const queries = installLog();
     const lines = [];
     const original = console.info;
@@ -162,6 +172,7 @@ describe("sendEmail", { concurrency: 1 }, () => {
     assert.deepEqual(result, { status: "sent", id: "msg_1" });
     assert.equal(sent.length, 1);
     assert.equal(sent[0].from, emailFromAddress());
+    assert.equal(sent[0].replyTo, "uprightmrp@gmail.com");
     assert.equal(sent[0].to, "ada@example.com");
     assert.equal(sent[0].subject, "We received your Upright payment");
     assert.match(sent[0].html, /\$25\.00/);
@@ -255,6 +266,190 @@ describe("sendEmail", { concurrency: 1 }, () => {
       if (previous === undefined) delete process.env.EMAIL_FROM;
       else process.env.EMAIL_FROM = previous;
     }
+  });
+
+  describe("gmail smtp", () => {
+  const gmailEnv = {
+    GMAIL_USER: "uprightmrp@gmail.com",
+    GMAIL_APP_PASSWORD: "abcd efgh ijkl mnop",
+  };
+
+  function withEnv(vars, fn) {
+    const previous = {};
+    for (const [key, value] of Object.entries(vars)) {
+      previous[key] = process.env[key];
+      if (value == null) delete process.env[key];
+      else process.env[key] = value;
+    }
+    const restore = () => {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    };
+    return Promise.resolve()
+      .then(fn)
+      .finally(restore);
+  }
+
+  it("prefers Gmail when both vars are set, even if Resend is also set", () => {
+    assert.equal(selectEmailProvider(gmailEnv), "gmail");
+    assert.equal(
+      selectEmailProvider({ ...gmailEnv, RESEND_API_KEY: "re_test" }),
+      "gmail"
+    );
+    assert.equal(
+      selectEmailProvider({ GMAIL_USER: "uprightmrp@gmail.com", RESEND_API_KEY: "re_test" }),
+      "resend"
+    );
+    assert.equal(
+      selectEmailProvider({ GMAIL_APP_PASSWORD: "abcdefghijklmnop", RESEND_API_KEY: "re_test" }),
+      "resend"
+    );
+    assert.equal(selectEmailProvider({ RESEND_API_KEY: "re_test" }), "resend");
+    assert.equal(selectEmailProvider({}), "skip");
+    assert.equal(
+      selectEmailProvider({ GMAIL_USER: "uprightmrp@gmail.com", GMAIL_APP_PASSWORD: "   " }),
+      "skip"
+    );
+  });
+
+  it("uses smtp.gmail.com port 465 and drops spaces in the app password", () => {
+    assert.deepEqual(gmailTransportOptions(gmailEnv), {
+      host: "smtp.gmail.com",
+      port: 465,
+      secure: true,
+      auth: {
+        user: "uprightmrp@gmail.com",
+        pass: "abcdefghijklmnop",
+      },
+    });
+    assert.equal(gmailFromAddress(gmailEnv), "Upright <uprightmrp@gmail.com>");
+    assert.equal(supportEmailAddress({}), "uprightmrp@gmail.com");
+    assert.equal(
+      supportEmailAddress({ SUPPORT_EMAIL: " help@example.com " }),
+      "help@example.com"
+    );
+  });
+
+  it("sends through a mocked Gmail transport and logs the message id", async () => {
+    resetEmailForTests();
+    const queries = installLog();
+    const sent = [];
+    const created = [];
+    setNodemailerForTests((options) => {
+      created.push(options);
+      return {
+        async sendMail(payload) {
+          sent.push(payload);
+          return { messageId: "<abc@smtp.gmail.com>" };
+        },
+      };
+    });
+
+    await withEnv({ ...gmailEnv, RESEND_API_KEY: "re_should_not_be_used", SUPPORT_EMAIL: "" }, async () => {
+      delete process.env.SUPPORT_EMAIL;
+      const result = await sendEmail({
+        to: "ada@example.com",
+        template: "welcome",
+        data: { name: "Ada", companyName: "Soap Co" },
+        clientId: 4,
+        userId: 8,
+      });
+      assert.deepEqual(result, { status: "sent", id: "<abc@smtp.gmail.com>" });
+    });
+
+    assert.equal(created.length, 1);
+    assert.equal(created[0].host, "smtp.gmail.com");
+    assert.equal(created[0].port, 465);
+    assert.equal(created[0].secure, true);
+    assert.deepEqual(created[0].auth, {
+      user: "uprightmrp@gmail.com",
+      pass: "abcdefghijklmnop",
+    });
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].from, "Upright <uprightmrp@gmail.com>");
+    assert.equal(sent[0].replyTo, "uprightmrp@gmail.com");
+    assert.equal(sent[0].to, "ada@example.com");
+    assert.match(sent[0].subject, /Welcome/);
+    const log = queries.find((query) => query.sql.includes("INSERT INTO email_log"));
+    assert.equal(log.params[4], "sent");
+    assert.equal(log.params[5], "<abc@smtp.gmail.com>");
+    assert.equal(log.params[6], null);
+  });
+
+  it("uses SUPPORT_EMAIL as reply-to and does not throw when Gmail fails", async () => {
+    resetEmailForTests();
+    const queries = installLog();
+    const sent = [];
+    setNodemailerForTests(() => ({
+      async sendMail(payload) {
+        sent.push(payload);
+        throw new Error("invalid login");
+      },
+    }));
+    const original = console.error;
+    console.error = () => {};
+    try {
+      await withEnv(
+        { ...gmailEnv, SUPPORT_EMAIL: "help@example.com" },
+        async () => {
+          const result = await sendEmail({
+            to: "ada@example.com",
+            template: "password_reset",
+            data: {
+              name: "Ada",
+              resetUrl: "https://app.example.com/reset-password?token=abc",
+            },
+            clientId: 4,
+            userId: 8,
+          });
+          assert.equal(result.status, "failed");
+          assert.match(result.error, /invalid login/);
+        }
+      );
+    } finally {
+      console.error = original;
+    }
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].replyTo, "help@example.com");
+    assert.equal(sent[0].from, "Upright <uprightmrp@gmail.com>");
+    const log = queries.find((query) => query.sql.includes("INSERT INTO email_log"));
+    assert.equal(log.params[4], "failed");
+    assert.match(log.params[6], /invalid login/);
+  });
+
+  it("does not open SMTP when only one Gmail variable is set", async () => {
+    resetEmailForTests();
+    const queries = installLog();
+    let created = 0;
+    setNodemailerForTests(() => {
+      created += 1;
+      throw new Error("should not create a transport");
+    });
+    const lines = [];
+    const original = console.info;
+    console.info = (line) => lines.push(String(line));
+    try {
+      await withEnv(
+        { GMAIL_USER: "uprightmrp@gmail.com", GMAIL_APP_PASSWORD: null, RESEND_API_KEY: null },
+        async () => {
+          const result = await sendEmail({
+            to: "ada@example.com",
+            template: "welcome",
+            data: { name: "Ada", companyName: "Soap Co" },
+          });
+          assert.deepEqual(result, { status: "skipped" });
+        }
+      );
+    } finally {
+      console.info = original;
+    }
+    assert.equal(created, 0);
+    assert.match(lines.join("\n"), /RESEND_API_KEY is not set/);
+    const log = queries.find((query) => query.sql.includes("INSERT INTO email_log"));
+    assert.equal(log.params[4], "skipped");
+  });
   });
 });
 
