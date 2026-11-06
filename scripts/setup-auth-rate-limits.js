@@ -1,7 +1,11 @@
 /**
- * One-time setup: auth_rate_limits table for login/register throttling.
+ * One-time setup: auth_rate_limits table for login, signup, and password reset.
  * One row per action + scope (ip|email) + subject. The window resets in
  * place, so attempts do not append a new row.
+ *
+ * Re-run this after the allowed actions change. If the table already exists,
+ * the script replaces the action check. Reset-password stays unlimited until
+ * that check includes 'reset_password' (the app fails open and logs it).
  *
  * Usage: node scripts/setup-auth-rate-limits.js
  *
@@ -43,7 +47,7 @@ async function main() {
     if (!(await tableExists(client, "auth_rate_limits"))) {
       await client.query(`
         CREATE TABLE auth_rate_limits (
-          action TEXT NOT NULL CHECK (action IN ('login', 'register', 'forgot_password')),
+          action TEXT NOT NULL CHECK (action IN ('login', 'register', 'forgot_password', 'reset_password')),
           scope TEXT NOT NULL CHECK (scope IN ('ip', 'email')),
           subject TEXT NOT NULL CHECK (char_length(subject) BETWEEN 1 AND 320),
           window_start TIMESTAMPTZ NOT NULL,
@@ -77,7 +81,7 @@ async function main() {
       await client.query(`
         ALTER TABLE auth_rate_limits
           ADD CONSTRAINT auth_rate_limits_action_check
-          CHECK (action IN ('login', 'register', 'forgot_password'))
+          CHECK (action IN ('login', 'register', 'forgot_password', 'reset_password'))
       `);
       console.log("Updated auth_rate_limits action check");
     }

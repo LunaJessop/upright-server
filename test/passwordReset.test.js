@@ -112,12 +112,37 @@ function installForgot({ user = null, limited = false } = {}) {
   return { queries, sent };
 }
 
-function installReset(tokenRow) {
+function resetWindowStart() {
+  const windowMs = AUTH_RATE_LIMITS.reset_password.ip.windowMs;
+  return new Date(Math.floor(Date.now() / windowMs) * windowMs);
+}
+
+function installReset(tokenRow, { limited = false } = {}) {
   const queries = [];
   const state = {
     token: tokenRow ? { ...tokenRow } : null,
     passwordHash: "old-hash",
     tokenVersion: 2,
+  };
+
+  pool.query = async (sql, params = []) => {
+    const text = String(sql);
+    queries.push({ sql: text, params });
+    if (text.includes("FROM auth_rate_limits")) {
+      if (!limited) return { rows: [] };
+      return {
+        rows: [
+          {
+            attempts: AUTH_RATE_LIMITS.reset_password.ip.limit,
+            window_start: resetWindowStart(),
+          },
+        ],
+      };
+    }
+    if (text.includes("INSERT INTO auth_rate_limits")) {
+      return { rows: [{ attempts: 1 }] };
+    }
+    throw new Error(`unexpected pool query: ${text}`);
   };
 
   pool.connect = async () => ({
@@ -306,6 +331,42 @@ describe("POST /api/auth/reset-password", { concurrency: 1 }, () => {
     );
     assert.equal(res.statusCode, 400);
     assert.equal(res.body.error, RESET_PASSWORD_INVALID_MESSAGE);
+  });
+
+  it("is rate limited per IP before it looks up the token", async () => {
+    let connected = false;
+    const { queries } = installReset(validToken(), { limited: true });
+    pool.connect = async () => {
+      connected = true;
+      throw new Error("should not connect");
+    };
+    const res = mockRes();
+    await resetPassword(mockReq({ token, password: "NewPassword1!" }), res);
+    assert.equal(res.statusCode, 429);
+    assert.match(res.body.error, /Too many attempts/);
+    assert.match(res.headers["Retry-After"], /^[1-9][0-9]*$/);
+    assert.equal(connected, false);
+    const peek = queries.find((query) => query.sql.includes("FROM auth_rate_limits"));
+    assert.equal(peek.params[0], "reset_password");
+    assert.equal(peek.params[1], "ip");
+    assert.equal(peek.params[2], "203.0.113.5");
+    assert.equal(
+      queries.some((query) => query.sql.includes("INSERT INTO auth_rate_limits")),
+      false
+    );
+  });
+
+  it("counts an attempt before accepting a new password", async () => {
+    const { queries } = installReset(validToken());
+    const res = mockRes();
+    await resetPassword(mockReq({ token, password: "NewPassword1!" }), res);
+    assert.equal(res.statusCode, 200);
+    const consumeAt = queries.findIndex((query) =>
+      query.sql.includes("INSERT INTO auth_rate_limits")
+    );
+    const updateAt = queries.findIndex((query) => query.sql.includes("UPDATE users"));
+    assert.ok(consumeAt > -1 && consumeAt < updateAt);
+    assert.equal(queries[consumeAt].params[0], "reset_password");
   });
 
   it("rejects a weak password before using the token", async () => {
