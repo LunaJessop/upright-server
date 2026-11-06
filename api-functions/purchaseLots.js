@@ -242,9 +242,10 @@ export async function deletePurchaseLot(req, res) {
 
     const qty = Number(owned[0].quantity);
     await adjustInventoryQuantity(dbClient, clientId, itemId, -qty);
-    await dbClient.query(`DELETE FROM purchase_lots WHERE id = $1`, [
-      purchaseLotId,
-    ]);
+    await dbClient.query(
+      `DELETE FROM purchase_lots WHERE id = $1 AND client_id = $2`,
+      [purchaseLotId, clientId]
+    );
     await syncItemUnitCostFromLots(dbClient, clientId, itemId);
 
     await dbClient.query("COMMIT");

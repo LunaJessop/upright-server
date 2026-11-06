@@ -44,7 +44,7 @@ const itemsSelect = `
         'name', t.name)
         ORDER BY lower(t.name))
        FROM item_tags it
-       JOIN tags t ON t.id = it.tag_id
+       JOIN tags t ON t.id = it.tag_id AND t.client_id = i.client_id
        WHERE it.item_id = i.id),
       '[]'::json
     ) AS tags,
@@ -56,7 +56,8 @@ const itemsSelect = `
         'source', s.source,
         'created_at', s.created_at)
         ORDER BY s.created_at DESC)
-       FROM item_skus s WHERE s.item_id = i.id),
+       FROM item_skus s
+       WHERE s.item_id = i.id AND s.client_id = i.client_id),
       '[]'::json
     ) AS item_skus,
     COALESCE(
@@ -69,11 +70,11 @@ const itemsSelect = `
         ORDER BY p.sequence)
        FROM item_router_phases p
        JOIN item_routers r ON r.id = p.router_id
-       WHERE r.item_id = i.id),
+       WHERE r.item_id = i.id AND r.client_id = i.client_id),
       '[]'::json
     ) AS router_phases
   FROM items i
-  LEFT JOIN vendors v ON v.id = i.vendor
+  LEFT JOIN vendors v ON v.id = i.vendor AND v.client_id = i.client_id
 `;
 
 function isMakeItem(makeOrBuy) {
@@ -276,11 +277,11 @@ async function assertBomComponentsBelongToClient(
   }
 }
 
-async function insertBomLines(dbClient, parentItemId, bomItems, existingBom = []) {
+async function insertBomLines(dbClient, clientId, parentItemId, bomItems, existingBom = []) {
   for (const line of bomItems) {
     const { rows: componentRows } = await dbClient.query(
-      `SELECT unit_of_measure FROM items WHERE id = $1`,
-      [line.component_item_id]
+      `SELECT unit_of_measure FROM items WHERE id = $1 AND client_id = $2`,
+      [line.component_item_id, clientId]
     );
     const stockRaw = componentRows[0]?.unit_of_measure ?? "";
     const resolved = resolveBomLineUnit(
@@ -315,6 +316,7 @@ export async function getItems(req, res) {
       params.push(tagId);
       where += ` AND EXISTS (
         SELECT 1 FROM item_tags it
+        JOIN tags tg ON tg.id = it.tag_id AND tg.client_id = i.client_id
         WHERE it.item_id = i.id AND it.tag_id = $${params.length}
       )`;
     }
@@ -452,7 +454,7 @@ export async function createItem(req, res) {
     const item = rows[0];
 
     await assertBomComponentsBelongToClient(dbClient, clientId, bom_items);
-    await insertBomLines(dbClient, item.id, bom_items);
+    await insertBomLines(dbClient, clientId, item.id, bom_items);
 
     const savedPhases = isMakeItem(make_or_buy)
       ? await replaceRouterPhases(dbClient, clientId, item.id, router_phases)
@@ -618,7 +620,7 @@ export async function updateItem(req, res) {
       existingBom
     );
     await dbClient.query("DELETE FROM bom_items WHERE parent_item_id = $1", [id]);
-    await insertBomLines(dbClient, id, bom_items, existingBom);
+    await insertBomLines(dbClient, clientId, id, bom_items, existingBom);
 
     const savedPhases = isMakeItem(make_or_buy)
       ? await replaceRouterPhases(dbClient, clientId, id, router_phases)
@@ -805,8 +807,13 @@ export async function changeItemUnit(req, res) {
         `UPDATE bom_items
          SET unit_of_measure = $1
          WHERE component_item_id = $2
-           AND (unit_of_measure IS NULL OR btrim(unit_of_measure) = '')`,
-        [previous, itemId]
+           AND (unit_of_measure IS NULL OR btrim(unit_of_measure) = '')
+           AND EXISTS (
+             SELECT 1 FROM items parent
+             WHERE parent.id = bom_items.parent_item_id
+               AND parent.client_id = $3
+           )`,
+        [previous, itemId, clientId]
       );
       await dbClient.query(
         `UPDATE items
@@ -921,7 +928,10 @@ export async function deleteItem(req, res) {
       "DELETE FROM bom_items WHERE parent_item_id = $1 OR component_item_id = $1",
       [id]
     );
-    await dbClient.query("DELETE FROM items WHERE id = $1", [id]);
+    await dbClient.query(
+      "DELETE FROM items WHERE id = $1 AND client_id = $2",
+      [id, clientId]
+    );
     await dbClient.query("COMMIT");
     res.status(204).end();
   } catch (err) {
