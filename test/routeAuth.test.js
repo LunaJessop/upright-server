@@ -61,10 +61,16 @@ describe("route authentication", () => {
     }
   });
 
-  it("keeps the client list behind a platform admin", () => {
-    const admin = calls.find((call) => routeKey(call) === "GET /api/admin/clients");
-    assert.ok(admin);
-    assert.match(admin, /requirePlatformAdmin/);
+  it("keeps admin routes behind a platform admin", () => {
+    const adminKeys = keys.filter((key) => key.startsWith("GET /api/admin/"));
+    assert.ok(adminKeys.includes("GET /api/admin/clients"));
+    assert.ok(adminKeys.includes("GET /api/admin/customers"));
+    assert.ok(adminKeys.includes("GET /api/admin/customers/:id"));
+    for (const key of adminKeys) {
+      const call = calls.find((entry) => routeKey(entry) === key);
+      assert.match(call, /requireAuth/);
+      assert.match(call, /requirePlatformAdmin/, key);
+    }
   });
 
   it("registers each public route once", () => {

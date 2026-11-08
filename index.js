@@ -35,6 +35,10 @@ import { forgotPassword, resetPassword } from "./api-functions/passwordReset.js"
 import { createCheckout, createPortal } from "./api-functions/billing.js";
 import { createClientUser, getClient } from "./api-functions/clients.js";
 import { listClients } from "./api-functions/admin.js";
+import {
+  getAdminCustomer,
+  listAdminCustomers,
+} from "./api-functions/adminCustomers.js";
 import { stripeWebhook } from "./api-functions/stripeWebhook.js";
 import { requireAuth, requirePlatformAdmin } from "./lib/auth.js";
 import {
@@ -75,6 +79,18 @@ app.get(
   requireAuth,
   requirePlatformAdmin,
   listClients
+);
+app.get(
+  "/api/admin/customers",
+  requireAuth,
+  requirePlatformAdmin,
+  listAdminCustomers
+);
+app.get(
+  "/api/admin/customers/:id",
+  requireAuth,
+  requirePlatformAdmin,
+  getAdminCustomer
 );
 
 app.get("/api/client", requireAuth, requireReadableSubscription, getClient);
