@@ -75,6 +75,7 @@ function installPool({ limited = false, userRows = [] } = {}) {
       };
     }
     if (sql.includes("FROM users")) return { rows: userRows };
+    if (sql.includes("INSERT INTO admin_activity")) return { rows: [] };
     throw new Error(`unexpected pool query: ${sql}`);
   };
   return queries;
