@@ -59,6 +59,11 @@ import {
   startImpersonation,
 } from "./api-functions/adminImpersonation.js";
 import { stripeWebhook } from "./api-functions/stripeWebhook.js";
+import {
+  applyOnboardingTemplate,
+  getOnboardingStatus,
+  getOnboardingTemplates,
+} from "./api-functions/onboarding.js";
 import { requireAuth, requirePlatformAdmin } from "./lib/auth.js";
 import {
   requireActiveSubscription,
@@ -91,6 +96,15 @@ app.post("/api/auth/forgot-password", forgotPassword);
 app.post("/api/auth/reset-password", resetPassword);
 app.post("/api/auth/logout", requireAuth, logout);
 app.get("/api/auth/me", requireAuth, getMe);
+
+app.get("/api/onboarding/templates", requireAuth, getOnboardingTemplates);
+app.get("/api/onboarding/status", requireAuth, getOnboardingStatus);
+app.post(
+  "/api/onboarding/apply",
+  requireAuth,
+  requireFounder,
+  applyOnboardingTemplate
+);
 
 app.post("/api/billing/checkout", requireAuth, requireFounder, createCheckout);
 app.post("/api/billing/portal", requireAuth, requireFounder, createPortal);
