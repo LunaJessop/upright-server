@@ -44,6 +44,8 @@ import {
   listAdminActivity,
 } from "./api-functions/adminActivity.js";
 import { captureServerErrors } from "./lib/activityLog.js";
+import { auditAdminRequests } from "./lib/adminAudit.js";
+import { listAdminAudit } from "./api-functions/adminAudit.js";
 import { stripeWebhook } from "./api-functions/stripeWebhook.js";
 import { requireAuth, requirePlatformAdmin } from "./lib/auth.js";
 import {
@@ -69,6 +71,7 @@ app.post(
 
 app.use(express.json());
 app.use(captureServerErrors);
+app.use(auditAdminRequests);
 
 app.post("/api/auth/login", login);
 app.post("/api/auth/register", register);
@@ -109,6 +112,12 @@ app.get(
   requireAuth,
   requirePlatformAdmin,
   listAdminActivity
+);
+app.get(
+  "/api/admin/audit",
+  requireAuth,
+  requirePlatformAdmin,
+  listAdminAudit
 );
 
 app.get("/api/client", requireAuth, requireReadableSubscription, getClient);
