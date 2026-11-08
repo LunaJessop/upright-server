@@ -384,7 +384,10 @@ describe("logout", () => {
 
 describe("schema contract", () => {
   it("looks up the session with one primary-key query and revokes by user id", () => {
-    assert.match(USER_SESSION_LOOKUP_SQL, /FROM users\s+WHERE id = \$1/);
+    assert.match(USER_SESSION_LOOKUP_SQL, /FROM users u/);
+    assert.match(USER_SESSION_LOOKUP_SQL, /JOIN clients c ON c\.id = u\.client_id/);
+    assert.match(USER_SESSION_LOOKUP_SQL, /WHERE u\.id = \$1/);
+    assert.match(USER_SESSION_LOOKUP_SQL, /c\.active AS client_active/);
     assert.match(USER_SESSION_LOOKUP_SQL, /token_version/);
     assert.match(USER_SESSION_LOOKUP_SQL, /client_id/);
     assert.match(USER_SESSION_LOOKUP_SQL, /email/);
