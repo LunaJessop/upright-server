@@ -2,6 +2,7 @@ import bcrypt from "bcryptjs";
 import { pool } from "../lib/db.js";
 import {
   logMissingTokenVersion,
+  publicImpersonation,
   revokeUserTokens,
   signAuthToken,
   userResponse,
@@ -346,11 +347,14 @@ export async function getMe(req, res) {
       [req.auth.userId]
     );
 
-    if (rows.length === 0 || !rows[0].active) {
+    if (rows.length === 0 || (!rows[0].active && !req.auth.impersonating)) {
       return res.status(401).json({ error: "User not found or inactive" });
     }
 
-    res.json({ user: userResponse(rows[0]) });
+    res.json({
+      user: userResponse(rows[0]),
+      impersonating: publicImpersonation(req.auth),
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load session" });

@@ -54,6 +54,10 @@ import {
   setCustomerActive,
   setMemberActive,
 } from "./api-functions/adminAccountActions.js";
+import {
+  endImpersonation,
+  startImpersonation,
+} from "./api-functions/adminImpersonation.js";
 import { stripeWebhook } from "./api-functions/stripeWebhook.js";
 import { requireAuth, requirePlatformAdmin } from "./lib/auth.js";
 import {
@@ -114,6 +118,17 @@ app.get(
   requireAuth,
   requirePlatformAdmin,
   getAdminCustomerBilling
+);
+app.post(
+  "/api/admin/customers/:id/users/:userId/impersonate",
+  requireAuth,
+  requirePlatformAdmin,
+  startImpersonation
+);
+app.post(
+  "/api/admin/impersonation/end",
+  requireAuth,
+  endImpersonation
 );
 app.post(
   "/api/admin/customers/:id/users/:userId/password-reset",

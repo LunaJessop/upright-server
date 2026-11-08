@@ -72,9 +72,15 @@ describe("route authentication", () => {
     assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/active"));
     assert.ok(adminKeys.includes("POST /api/admin/customers/:id/active"));
     assert.ok(adminKeys.includes("POST /api/admin/customers/:id/grace"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/impersonate"));
+    assert.ok(adminKeys.includes("POST /api/admin/impersonation/end"));
     for (const key of adminKeys) {
       const call = calls.find((entry) => routeKey(entry) === key);
       assert.match(call, /requireAuth/);
+      if (key === "POST /api/admin/impersonation/end") {
+        assert.doesNotMatch(call, /requirePlatformAdmin/);
+        continue;
+      }
       assert.match(call, /requirePlatformAdmin/, key);
     }
   });
