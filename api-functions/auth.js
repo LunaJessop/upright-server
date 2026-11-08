@@ -110,7 +110,7 @@ export async function login(req, res) {
   try {
     const { rows } = await pool.query(
       `SELECT u.id, u.client_id, u.name, u.email, u.password_hash, u.role, u.active,
-              u.token_version, u.created_at,
+              u.token_version, u.created_at, c.active AS client_active,
               c.name AS client_name,
               c.slug AS client_slug,
               c.email AS client_email,
@@ -134,16 +134,20 @@ export async function login(req, res) {
 
     const user = rows[0];
 
-    if (!user.active) {
+    if (!user.active || user.client_active === false) {
       await consumeAuthRateLimit(dbQuery, rateLimit);
       await recordActivity({
         type: "login_failed",
         clientId: user.client_id,
         userId: user.id,
         email: user.email,
-        message: "Account inactive",
+        message: user.client_active === false ? "Company inactive" : "Account inactive",
       });
-      return res.status(403).json({ error: "This account is inactive" });
+      return res.status(403).json({
+        error: user.client_active === false
+          ? "This company is inactive"
+          : "This account is inactive",
+      });
     }
 
     const valid = await bcrypt.compare(password, user.password_hash);

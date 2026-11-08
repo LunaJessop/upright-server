@@ -46,6 +46,13 @@ import {
 import { captureServerErrors } from "./lib/activityLog.js";
 import { auditAdminRequests } from "./lib/adminAudit.js";
 import { listAdminAudit } from "./api-functions/adminAudit.js";
+import {
+  extendCustomerGrace,
+  resendMemberInvite,
+  sendMemberPasswordReset,
+  setCustomerActive,
+  setMemberActive,
+} from "./api-functions/adminAccountActions.js";
 import { stripeWebhook } from "./api-functions/stripeWebhook.js";
 import { requireAuth, requirePlatformAdmin } from "./lib/auth.js";
 import {
@@ -100,6 +107,36 @@ app.get(
   requireAuth,
   requirePlatformAdmin,
   getAdminCustomerActivity
+);
+app.post(
+  "/api/admin/customers/:id/users/:userId/password-reset",
+  requireAuth,
+  requirePlatformAdmin,
+  sendMemberPasswordReset
+);
+app.post(
+  "/api/admin/customers/:id/users/:userId/invite",
+  requireAuth,
+  requirePlatformAdmin,
+  resendMemberInvite
+);
+app.post(
+  "/api/admin/customers/:id/users/:userId/active",
+  requireAuth,
+  requirePlatformAdmin,
+  setMemberActive
+);
+app.post(
+  "/api/admin/customers/:id/active",
+  requireAuth,
+  requirePlatformAdmin,
+  setCustomerActive
+);
+app.post(
+  "/api/admin/customers/:id/grace",
+  requireAuth,
+  requirePlatformAdmin,
+  extendCustomerGrace
 );
 app.get(
   "/api/admin/customers/:id",

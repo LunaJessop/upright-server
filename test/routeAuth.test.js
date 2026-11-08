@@ -62,10 +62,15 @@ describe("route authentication", () => {
   });
 
   it("keeps admin routes behind a platform admin", () => {
-    const adminKeys = keys.filter((key) => key.startsWith("GET /api/admin/"));
+    const adminKeys = keys.filter((key) => key.includes(" /api/admin/"));
     assert.ok(adminKeys.includes("GET /api/admin/clients"));
     assert.ok(adminKeys.includes("GET /api/admin/customers"));
     assert.ok(adminKeys.includes("GET /api/admin/customers/:id"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/password-reset"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/invite"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/active"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/active"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/grace"));
     for (const key of adminKeys) {
       const call = calls.find((entry) => routeKey(entry) === key);
       assert.match(call, /requireAuth/);
