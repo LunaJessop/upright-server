@@ -17,6 +17,7 @@ import {
   buildCrossKindPreview,
   conversionCounts,
   conversionRequired,
+  incompatibleRecipeLines,
   isDryRun,
   parseConversionFactor,
   quantityInStockUnit,
@@ -910,6 +911,22 @@ async function writeCrossKindConversion(db, clientId, itemId, fromUnit, nextUnit
 async function respondCrossKindUnitChange(db, res, input) {
   const { clientId, itemId, previous, nextUnit, prices, body } = input;
   const snapshot = await loadCrossKindSnapshot(db, clientId, itemId, prices);
+  const incompatible = incompatibleRecipeLines(snapshot.ingredientLines, previous);
+  if (incompatible.length > 0) {
+    await db.query("ROLLBACK");
+    const names = incompatible
+      .map((line) => line.parentName)
+      .filter(Boolean);
+    const listed = names.length > 0 ? ` (${names.join(", ")})` : "";
+    return res.status(400).json({
+      error: `Can't change this unit. A recipe line${listed} uses a unit that doesn't convert to ${spokenUnit(previous)}.`,
+      code: "INCOMPATIBLE_RECIPE_LINE",
+      fromUnit: previous,
+      toUnit: nextUnit,
+      lines: incompatible,
+    });
+  }
+
   const counts = conversionCounts(snapshot);
   const required = conversionRequired(snapshot);
   const parsed = parseConversionFactor(body?.factor);

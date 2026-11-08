@@ -4,6 +4,7 @@ import {
   buildCrossKindPreview,
   conversionCounts,
   conversionRequired,
+  incompatibleRecipeLines,
   parseConversionFactor,
   quantityInStockUnit,
 } from "../lib/crossKindUnit.js";
@@ -27,6 +28,22 @@ describe("cross-kind conversion factor", () => {
     assert.equal(quantityInStockUnit(2, "cup", "fl_oz"), 16);
     assert.equal(quantityInStockUnit(4, "", "fl_oz"), 4);
     assert.equal(quantityInStockUnit(4, "fl_oz", "fl_oz"), 4);
+    assert.equal(quantityInStockUnit(2, "g", "fl_oz"), null);
+    assert.equal(quantityInStockUnit(2, "widgets", "fl_oz"), null);
+  });
+
+  it("lists recipe lines that cannot convert into the old stock unit", () => {
+    const lines = incompatibleRecipeLines(
+      [
+        { parentItemId: 3, parentName: "Soap", quantity: 2, unit: "g" },
+        { parentItemId: 4, parentName: "Lotion", quantity: 1, unit: "cup" },
+        { parentItemId: 5, parentName: "Blank", quantity: 3, unit: "" },
+      ],
+      "fl_oz"
+    );
+    assert.deepEqual(lines, [
+      { parentItemId: 3, parentName: "Soap", quantity: 2, unit: "g" },
+    ]);
   });
 
   it("counts stock, recipe lines, and distinct batches", () => {

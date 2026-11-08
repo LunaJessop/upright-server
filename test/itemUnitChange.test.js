@@ -211,7 +211,7 @@ describe("POST /api/items/:id/change-unit", { concurrency: 1 }, () => {
     );
   });
 
-  function installCrossKindDb() {
+  function installCrossKindDb({ ingredientUnit = "cup" } = {}) {
     const queries = [];
     pool.connect = async () => ({
       async query(sql, params = []) {
@@ -247,7 +247,7 @@ describe("POST /api/items/:id/change-unit", { concurrency: 1 }, () => {
                 parent_item_id: 3,
                 parent_name: "Soap",
                 quantity: 2,
-                unit_of_measure: "cup",
+                unit_of_measure: ingredientUnit,
               },
             ],
           };
@@ -293,6 +293,33 @@ describe("POST /api/items/:id/change-unit", { concurrency: 1 }, () => {
     });
     return queries;
   }
+
+  it("refuses a recipe line that cannot convert to the old stock unit", async () => {
+    for (const extra of [{ dryRun: true }, { dryRun: true, factor: 8 }, { factor: 8 }]) {
+      const queries = installCrossKindDb({ ingredientUnit: "g" });
+      const res = mockRes();
+      await changeItemUnit(changeReq("ea", extra), res);
+
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.body.code, "INCOMPATIBLE_RECIPE_LINE");
+      assert.equal(res.body.fromUnit, "fl_oz");
+      assert.equal(res.body.toUnit, "ea");
+      assert.match(res.body.error, /Soap/);
+      assert.match(res.body.error, /fl oz/);
+      assert.deepEqual(res.body.lines, [
+        { parentItemId: 3, parentName: "Soap", quantity: 2, unit: "g" },
+      ]);
+      assert.equal(
+        queries.some((query) => /^\s*(UPDATE|INSERT|DELETE)\b/i.test(query.sql)),
+        false
+      );
+      assert.ok(queries.some((query) => query.sql === "ROLLBACK"));
+      assert.equal(
+        queries.some((query) => query.sql === "COMMIT"),
+        false
+      );
+    }
+  });
 
   it("asks for a factor when stock, a recipe, or a batch still uses the old unit", async () => {
     const queries = installCrossKindDb();
