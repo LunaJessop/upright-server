@@ -46,6 +46,7 @@ import {
 import { captureServerErrors } from "./lib/activityLog.js";
 import { auditAdminRequests } from "./lib/adminAudit.js";
 import { listAdminAudit } from "./api-functions/adminAudit.js";
+import { getAdminCustomerBilling } from "./api-functions/adminBilling.js";
 import {
   extendCustomerGrace,
   resendMemberInvite,
@@ -107,6 +108,12 @@ app.get(
   requireAuth,
   requirePlatformAdmin,
   getAdminCustomerActivity
+);
+app.get(
+  "/api/admin/customers/:id/billing",
+  requireAuth,
+  requirePlatformAdmin,
+  getAdminCustomerBilling
 );
 app.post(
   "/api/admin/customers/:id/users/:userId/password-reset",

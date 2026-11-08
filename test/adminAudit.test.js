@@ -50,6 +50,14 @@ describe("admin request audit", () => {
     assert.equal(view.action, "view_customer");
     assert.equal(view.clientId, 4);
     assert.equal(view.recordType, "customer");
+    const billing = describeAdminRequest({
+      method: "GET",
+      path: "/api/admin/customers/4/billing",
+    });
+    assert.equal(billing.action, "view_customer_billing");
+    assert.equal(billing.clientId, 4);
+    assert.equal(billing.before, null);
+    assert.equal(billing.after, null);
     assert.equal(
       describeAdminRequest({ method: "GET", path: "/api/admin/customers" }),
       null
