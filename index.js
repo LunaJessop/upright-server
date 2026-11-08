@@ -39,7 +39,31 @@ import {
   getAdminCustomer,
   listAdminCustomers,
 } from "./api-functions/adminCustomers.js";
+import {
+  getAdminCustomerActivity,
+  listAdminActivity,
+} from "./api-functions/adminActivity.js";
+import { captureServerErrors } from "./lib/activityLog.js";
+import { auditAdminRequests } from "./lib/adminAudit.js";
+import { listAdminAudit } from "./api-functions/adminAudit.js";
+import { getAdminCustomerBilling } from "./api-functions/adminBilling.js";
+import {
+  extendCustomerGrace,
+  resendMemberInvite,
+  sendMemberPasswordReset,
+  setCustomerActive,
+  setMemberActive,
+} from "./api-functions/adminAccountActions.js";
+import {
+  endImpersonation,
+  startImpersonation,
+} from "./api-functions/adminImpersonation.js";
 import { stripeWebhook } from "./api-functions/stripeWebhook.js";
+import {
+  applyOnboardingTemplate,
+  getOnboardingStatus,
+  getOnboardingTemplates,
+} from "./api-functions/onboarding.js";
 import { requireAuth, requirePlatformAdmin } from "./lib/auth.js";
 import {
   requireActiveSubscription,
@@ -63,6 +87,8 @@ app.post(
 );
 
 app.use(express.json());
+app.use(captureServerErrors);
+app.use(auditAdminRequests);
 
 app.post("/api/auth/login", login);
 app.post("/api/auth/register", register);
@@ -70,6 +96,15 @@ app.post("/api/auth/forgot-password", forgotPassword);
 app.post("/api/auth/reset-password", resetPassword);
 app.post("/api/auth/logout", requireAuth, logout);
 app.get("/api/auth/me", requireAuth, getMe);
+
+app.get("/api/onboarding/templates", requireAuth, getOnboardingTemplates);
+app.get("/api/onboarding/status", requireAuth, getOnboardingStatus);
+app.post(
+  "/api/onboarding/apply",
+  requireAuth,
+  requireFounder,
+  applyOnboardingTemplate
+);
 
 app.post("/api/billing/checkout", requireAuth, requireFounder, createCheckout);
 app.post("/api/billing/portal", requireAuth, requireFounder, createPortal);
@@ -87,10 +122,75 @@ app.get(
   listAdminCustomers
 );
 app.get(
+  "/api/admin/customers/:id/activity",
+  requireAuth,
+  requirePlatformAdmin,
+  getAdminCustomerActivity
+);
+app.get(
+  "/api/admin/customers/:id/billing",
+  requireAuth,
+  requirePlatformAdmin,
+  getAdminCustomerBilling
+);
+app.post(
+  "/api/admin/customers/:id/users/:userId/impersonate",
+  requireAuth,
+  requirePlatformAdmin,
+  startImpersonation
+);
+app.post(
+  "/api/admin/impersonation/end",
+  requireAuth,
+  endImpersonation
+);
+app.post(
+  "/api/admin/customers/:id/users/:userId/password-reset",
+  requireAuth,
+  requirePlatformAdmin,
+  sendMemberPasswordReset
+);
+app.post(
+  "/api/admin/customers/:id/users/:userId/invite",
+  requireAuth,
+  requirePlatformAdmin,
+  resendMemberInvite
+);
+app.post(
+  "/api/admin/customers/:id/users/:userId/active",
+  requireAuth,
+  requirePlatformAdmin,
+  setMemberActive
+);
+app.post(
+  "/api/admin/customers/:id/active",
+  requireAuth,
+  requirePlatformAdmin,
+  setCustomerActive
+);
+app.post(
+  "/api/admin/customers/:id/grace",
+  requireAuth,
+  requirePlatformAdmin,
+  extendCustomerGrace
+);
+app.get(
   "/api/admin/customers/:id",
   requireAuth,
   requirePlatformAdmin,
   getAdminCustomer
+);
+app.get(
+  "/api/admin/activity",
+  requireAuth,
+  requirePlatformAdmin,
+  listAdminActivity
+);
+app.get(
+  "/api/admin/audit",
+  requireAuth,
+  requirePlatformAdmin,
+  listAdminAudit
 );
 
 app.get("/api/client", requireAuth, requireReadableSubscription, getClient);

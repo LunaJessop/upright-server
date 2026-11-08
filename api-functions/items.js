@@ -14,6 +14,11 @@ import {
 import { resolveVendorId } from "./vendors.js";
 import { parseEstimatedMinutes } from "../lib/estimatedMinutes.js";
 import {
+  hasBomPhaseColumn,
+  parsePhaseId,
+  phaseNamesById,
+} from "../lib/bomPhase.js";
+import {
   buildCrossKindPreview,
   conversionCounts,
   conversionRequired,
@@ -24,17 +29,41 @@ import {
   spokenUnit,
 } from "../lib/crossKindUnit.js";
 
-const itemsSelect = `
-  SELECT i.*,
-    v.name AS vendor_name,
+function bomItemsSelect(withPhase) {
+  if (!withPhase) {
+    return `
     COALESCE(
       (SELECT json_agg(json_build_object(
         'component_item_id', b.component_item_id,
         'quantity', b.quantity,
-        'unit_of_measure', b.unit_of_measure))
+        'unit_of_measure', b.unit_of_measure,
+        'phase_id', NULL,
+        'phase_name', NULL))
        FROM bom_items b WHERE b.parent_item_id = i.id),
       '[]'::json
-    ) AS bom_items,
+    ) AS bom_items`;
+  }
+  return `
+    COALESCE(
+      (SELECT json_agg(json_build_object(
+        'component_item_id', b.component_item_id,
+        'quantity', b.quantity,
+        'unit_of_measure', b.unit_of_measure,
+        'phase_id', b.phase_id,
+        'phase_name', ph.name))
+       FROM bom_items b
+       LEFT JOIN client_router_phase_templates ph
+         ON ph.id = b.phase_id AND ph.client_id = i.client_id
+       WHERE b.parent_item_id = i.id),
+      '[]'::json
+    ) AS bom_items`;
+}
+
+function itemsSelect(withPhase) {
+  return `
+  SELECT i.*,
+    v.name AS vendor_name,
+    ${bomItemsSelect(withPhase)},
     COALESCE(
       (SELECT json_agg(json_build_object(
         'id', p.id,
@@ -85,6 +114,11 @@ const itemsSelect = `
   FROM items i
   LEFT JOIN vendors v ON v.id = i.vendor AND v.client_id = i.client_id
 `;
+}
+
+async function itemSelectSql(db = pool) {
+  return itemsSelect(await hasBomPhaseColumn(db));
+}
 
 function isMakeItem(makeOrBuy) {
   return isMake(makeOrBuy);
@@ -286,7 +320,29 @@ async function assertBomComponentsBelongToClient(
   }
 }
 
-async function insertBomLines(dbClient, clientId, parentItemId, bomItems, existingBom = []) {
+async function insertBomLines(
+  dbClient,
+  clientId,
+  parentItemId,
+  bomItems,
+  existingBom = [],
+  phaseColumn = false
+) {
+  const phaseIds = [];
+  if (phaseColumn) {
+    for (const line of bomItems) {
+      const parsed = parsePhaseId(line.phase_id);
+      if (!parsed.ok) {
+        throw Object.assign(new Error(parsed.error), { status: 400 });
+      }
+      if (parsed.phaseId) phaseIds.push(parsed.phaseId);
+    }
+  }
+  const names = phaseColumn
+    ? await phaseNamesById(dbClient, clientId, phaseIds)
+    : new Map();
+
+  const saved = [];
   for (const line of bomItems) {
     const { rows: componentRows } = await dbClient.query(
       `SELECT unit_of_measure FROM items WHERE id = $1 AND client_id = $2`,
@@ -302,12 +358,29 @@ async function insertBomLines(dbClient, clientId, parentItemId, bomItems, existi
       throw Object.assign(new Error(resolved.error), { status: 400 });
     }
 
-    await dbClient.query(
-      `INSERT INTO bom_items (parent_item_id, component_item_id, quantity, unit_of_measure)
-       VALUES ($1, $2, $3, $4)`,
-      [parentItemId, line.component_item_id, line.quantity, resolved.unit]
-    );
+    const phaseId = phaseColumn ? parsePhaseId(line.phase_id).phaseId : null;
+    if (phaseColumn) {
+      await dbClient.query(
+        `INSERT INTO bom_items
+           (parent_item_id, component_item_id, quantity, unit_of_measure, phase_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [parentItemId, line.component_item_id, line.quantity, resolved.unit, phaseId]
+      );
+    } else {
+      await dbClient.query(
+        `INSERT INTO bom_items (parent_item_id, component_item_id, quantity, unit_of_measure)
+         VALUES ($1, $2, $3, $4)`,
+        [parentItemId, line.component_item_id, line.quantity, resolved.unit]
+      );
+    }
+    saved.push({
+      ...line,
+      unit_of_measure: line.unit_of_measure,
+      phase_id: phaseId,
+      phase_name: phaseId == null ? null : names.get(phaseId) ?? null,
+    });
   }
+  return saved;
 }
 
 export async function getItems(req, res) {
@@ -330,7 +403,7 @@ export async function getItems(req, res) {
       )`;
     }
     const { rows } = await pool.query(
-      `${itemsSelect} ${where} ORDER BY i.id`,
+      `${await itemSelectSql(pool)} ${where} ORDER BY i.id`,
       params
     );
     res.json(rows);
@@ -346,7 +419,7 @@ export async function getItemById(req, res) {
 
   try {
     const { rows } = await pool.query(
-      `${itemsSelect} WHERE i.id = $1 AND i.client_id = $2`,
+      `${await itemSelectSql(pool)} WHERE i.id = $1 AND i.client_id = $2`,
       [id, clientId]
     );
 
@@ -462,8 +535,16 @@ export async function createItem(req, res) {
     );
     const item = rows[0];
 
+    const phaseColumn = await hasBomPhaseColumn(dbClient);
     await assertBomComponentsBelongToClient(dbClient, clientId, bom_items);
-    await insertBomLines(dbClient, clientId, item.id, bom_items);
+    const savedBom = await insertBomLines(
+      dbClient,
+      clientId,
+      item.id,
+      bom_items,
+      [],
+      phaseColumn
+    );
 
     const savedPhases = isMakeItem(make_or_buy)
       ? await replaceRouterPhases(dbClient, clientId, item.id, router_phases)
@@ -474,7 +555,7 @@ export async function createItem(req, res) {
     await dbClient.query("COMMIT");
     res.status(201).json({
       ...item,
-      bom_items,
+      bom_items: savedBom,
       item_skus: [],
       router_phases: savedPhases,
       tags: savedTags,
@@ -622,6 +703,7 @@ export async function updateItem(req, res) {
       return res.status(404).json({ error: "Item not found" });
     }
 
+    const phaseColumn = await hasBomPhaseColumn(dbClient);
     await assertBomComponentsBelongToClient(
       dbClient,
       clientId,
@@ -629,7 +711,14 @@ export async function updateItem(req, res) {
       existingBom
     );
     await dbClient.query("DELETE FROM bom_items WHERE parent_item_id = $1", [id]);
-    await insertBomLines(dbClient, clientId, id, bom_items, existingBom);
+    await insertBomLines(
+      dbClient,
+      clientId,
+      id,
+      bom_items,
+      existingBom,
+      phaseColumn
+    );
 
     const savedPhases = isMakeItem(make_or_buy)
       ? await replaceRouterPhases(dbClient, clientId, id, router_phases)
@@ -640,7 +729,7 @@ export async function updateItem(req, res) {
     await dbClient.query("COMMIT");
 
     const { rows: fullRows } = await pool.query(
-      `${itemsSelect} WHERE i.id = $1 AND i.client_id = $2`,
+      `${await itemSelectSql(pool)} WHERE i.id = $1 AND i.client_id = $2`,
       [id, clientId]
     );
 
@@ -669,7 +758,7 @@ export async function updateItem(req, res) {
 
 async function loadItemResponse(db, itemId, clientId) {
   const { rows } = await db.query(
-    `${itemsSelect} WHERE i.id = $1 AND i.client_id = $2`,
+    `${await itemSelectSql(db)} WHERE i.id = $1 AND i.client_id = $2`,
     [itemId, clientId]
   );
   return rows[0] ?? null;

@@ -142,6 +142,7 @@ function installReset(tokenRow, { limited = false } = {}) {
     if (text.includes("INSERT INTO auth_rate_limits")) {
       return { rows: [{ attempts: 1 }] };
     }
+    if (text.includes("INSERT INTO admin_activity")) return { rows: [] };
     throw new Error(`unexpected pool query: ${text}`);
   };
 

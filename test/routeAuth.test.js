@@ -62,13 +62,30 @@ describe("route authentication", () => {
   });
 
   it("keeps admin routes behind a platform admin", () => {
-    const adminKeys = keys.filter((key) => key.startsWith("GET /api/admin/"));
+    const adminKeys = keys.filter((key) => key.includes(" /api/admin/"));
     assert.ok(adminKeys.includes("GET /api/admin/clients"));
     assert.ok(adminKeys.includes("GET /api/admin/customers"));
     assert.ok(adminKeys.includes("GET /api/admin/customers/:id"));
+    assert.ok(adminKeys.includes("GET /api/admin/customers/:id/billing"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/password-reset"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/invite"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/active"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/active"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/grace"));
+    assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/impersonate"));
+    assert.ok(adminKeys.includes("POST /api/admin/impersonation/end"));
+    assert.ok(keys.includes("GET /api/onboarding/templates"));
+    assert.ok(keys.includes("GET /api/onboarding/status"));
+    assert.ok(keys.includes("POST /api/onboarding/apply"));
+    const apply = calls.find((entry) => routeKey(entry) === "POST /api/onboarding/apply");
+    assert.match(apply, /requireFounder/);
     for (const key of adminKeys) {
       const call = calls.find((entry) => routeKey(entry) === key);
       assert.match(call, /requireAuth/);
+      if (key === "POST /api/admin/impersonation/end") {
+        assert.doesNotMatch(call, /requirePlatformAdmin/);
+        continue;
+      }
       assert.match(call, /requirePlatformAdmin/, key);
     }
   });

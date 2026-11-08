@@ -273,15 +273,22 @@ async function handleCheckoutCompleted(session) {
   );
 }
 
+function invoiceSubscriptionId(invoice) {
+  const direct = invoice?.subscription;
+  if (typeof direct === "string" && direct) return direct;
+  if (direct?.id) return direct.id;
+  const parent = invoice?.parent?.subscription_details?.subscription;
+  if (typeof parent === "string" && parent) return parent;
+  if (parent?.id) return parent.id;
+  return null;
+}
+
 async function handleInvoicePaymentFailed(invoice) {
   const customerId = invoice.customer;
   const clientId = await findClientIdFromCustomer(customerId);
   if (!clientId) return;
 
-  const subscriptionId =
-    typeof invoice.subscription === "string"
-      ? invoice.subscription
-      : invoice.subscription?.id ?? null;
+  const subscriptionId = invoiceSubscriptionId(invoice);
 
   const saved = await updateClientSubscription(
     clientId,
@@ -309,6 +316,20 @@ async function handleInvoicePaymentFailed(invoice) {
 async function handleInvoicePaid(invoice) {
   const clientId = await findClientIdFromCustomer(invoice.customer);
   if (!clientId) return;
+  const subscriptionId = invoiceSubscriptionId(invoice);
+  if (subscriptionId) {
+    await pool.query(
+      `UPDATE clients SET
+         subscription_status = 'active',
+         past_due_started_at = NULL,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+         AND stripe_subscription_id = $2
+         AND subscription_status IN ('past_due', 'unpaid')
+       RETURNING id`,
+      [clientId, subscriptionId]
+    );
+  }
   const amount = formatMoney(invoice.amount_paid, invoice.currency);
   if (!amount) return;
   await notifyBilling(clientId, "payment_succeeded", {
