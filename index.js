@@ -39,6 +39,11 @@ import {
   getAdminCustomer,
   listAdminCustomers,
 } from "./api-functions/adminCustomers.js";
+import {
+  getAdminCustomerActivity,
+  listAdminActivity,
+} from "./api-functions/adminActivity.js";
+import { captureServerErrors } from "./lib/activityLog.js";
 import { stripeWebhook } from "./api-functions/stripeWebhook.js";
 import { requireAuth, requirePlatformAdmin } from "./lib/auth.js";
 import {
@@ -63,6 +68,7 @@ app.post(
 );
 
 app.use(express.json());
+app.use(captureServerErrors);
 
 app.post("/api/auth/login", login);
 app.post("/api/auth/register", register);
@@ -87,10 +93,22 @@ app.get(
   listAdminCustomers
 );
 app.get(
+  "/api/admin/customers/:id/activity",
+  requireAuth,
+  requirePlatformAdmin,
+  getAdminCustomerActivity
+);
+app.get(
   "/api/admin/customers/:id",
   requireAuth,
   requirePlatformAdmin,
   getAdminCustomer
+);
+app.get(
+  "/api/admin/activity",
+  requireAuth,
+  requirePlatformAdmin,
+  listAdminActivity
 );
 
 app.get("/api/client", requireAuth, requireReadableSubscription, getClient);

@@ -9,6 +9,7 @@ import {
   rateLimitErrorMessage,
 } from "../lib/authRateLimit.js";
 import { sendEmail } from "../lib/email/index.js";
+import { recordActivity } from "../lib/activityLog.js";
 
 const RESET_TTL_MS = 60 * 60 * 1000;
 
@@ -28,7 +29,13 @@ function dbQuery(sql, params) {
   return pool.query(sql, params);
 }
 
-function sendRateLimited(res, retryAfterSeconds) {
+async function sendRateLimited(res, retryAfterSeconds, action, email) {
+  await recordActivity({
+    type: "rate_limited",
+    email,
+    message: "Too many attempts",
+    detail: { action },
+  });
   const seconds = Math.max(1, Number(retryAfterSeconds) || 1);
   res.setHeader("Retry-After", String(seconds));
   return res.status(429).json({ error: rateLimitErrorMessage(seconds) });
@@ -105,12 +112,19 @@ export async function forgotPassword(req, res) {
   };
   const gate = await inspectAuthRateLimit(dbQuery, rateLimit);
   if (gate.limited) {
-    return sendRateLimited(res, gate.retryAfterSeconds);
+    return sendRateLimited(res, gate.retryAfterSeconds, "forgot_password", email);
   }
   await consumeAuthRateLimit(dbQuery, rateLimit);
 
   try {
     const issued = await issueResetToken(email);
+    await recordActivity({
+      type: "password_reset_requested",
+      clientId: issued?.user.client_id ?? null,
+      userId: issued?.user.id ?? null,
+      email,
+      message: "Password reset requested",
+    });
     if (issued) {
       await sendEmail({
         to: issued.user.email,
@@ -150,7 +164,7 @@ export async function resetPassword(req, res) {
   };
   const gate = await inspectAuthRateLimit(dbQuery, rateLimit);
   if (gate.limited) {
-    return sendRateLimited(res, gate.retryAfterSeconds);
+    return sendRateLimited(res, gate.retryAfterSeconds, "reset_password", null);
   }
   await consumeAuthRateLimit(dbQuery, rateLimit);
 
@@ -158,7 +172,7 @@ export async function resetPassword(req, res) {
   try {
     await db.query("BEGIN");
     const { rows } = await db.query(
-      `SELECT t.id, t.user_id, t.expires_at, t.used_at, u.active
+      `SELECT t.id, t.user_id, t.expires_at, t.used_at, u.active, u.client_id, u.email
        FROM password_reset_tokens t
        JOIN users u ON u.id = t.user_id
        WHERE t.token_hash = $1
@@ -195,6 +209,13 @@ export async function resetPassword(req, res) {
       [row.user_id]
     );
     await db.query("COMMIT");
+    await recordActivity({
+      type: "password_reset",
+      clientId: row.client_id,
+      userId: row.user_id,
+      email: row.email,
+      message: "Password updated",
+    });
     return res.json({ ok: true, message: RESET_PASSWORD_SUCCESS_MESSAGE });
   } catch (err) {
     try {

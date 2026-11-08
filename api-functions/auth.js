@@ -18,6 +18,7 @@ import {
   rateLimitErrorMessage,
 } from "../lib/authRateLimit.js";
 import { sendEmail } from "../lib/email/index.js";
+import { recordActivity } from "../lib/activityLog.js";
 
 // Same cost factor as real password hashes so an unknown email is not a fast oracle.
 const DUMMY_PASSWORD_HASH =
@@ -33,7 +34,13 @@ function dbQuery(sql, params) {
   return pool.query(sql, params);
 }
 
-function sendRateLimited(res, retryAfterSeconds) {
+async function sendRateLimited(res, retryAfterSeconds, action, email) {
+  await recordActivity({
+    type: "rate_limited",
+    email,
+    message: "Too many attempts",
+    detail: { action },
+  });
   const seconds = Math.max(1, Number(retryAfterSeconds) || 1);
   res.setHeader("Retry-After", String(seconds));
   return res.status(429).json({ error: rateLimitErrorMessage(seconds) });
@@ -97,7 +104,7 @@ export async function login(req, res) {
 
   const gate = await inspectAuthRateLimit(dbQuery, rateLimit);
   if (gate.limited) {
-    return sendRateLimited(res, gate.retryAfterSeconds);
+    return sendRateLimited(res, gate.retryAfterSeconds, "login", normalizedEmail);
   }
 
   try {
@@ -117,6 +124,11 @@ export async function login(req, res) {
     if (rows.length === 0) {
       await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       await consumeAuthRateLimit(dbQuery, rateLimit);
+      await recordActivity({
+        type: "login_failed",
+        email: normalizedEmail,
+        message: "Invalid email or password",
+      });
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
@@ -124,16 +136,37 @@ export async function login(req, res) {
 
     if (!user.active) {
       await consumeAuthRateLimit(dbQuery, rateLimit);
+      await recordActivity({
+        type: "login_failed",
+        clientId: user.client_id,
+        userId: user.id,
+        email: user.email,
+        message: "Account inactive",
+      });
       return res.status(403).json({ error: "This account is inactive" });
     }
 
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
       await consumeAuthRateLimit(dbQuery, rateLimit);
+      await recordActivity({
+        type: "login_failed",
+        clientId: user.client_id,
+        userId: user.id,
+        email: user.email,
+        message: "Invalid email or password",
+      });
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
     const token = tokenForUser(user);
+    await recordActivity({
+      type: "login",
+      clientId: user.client_id,
+      userId: user.id,
+      email: user.email,
+      message: "Signed in",
+    });
 
     res.json({
       token,
@@ -180,7 +213,7 @@ export async function register(req, res) {
   };
   const gate = await inspectAuthRateLimit(dbQuery, rateLimit);
   if (gate.limited) {
-    return sendRateLimited(res, gate.retryAfterSeconds);
+    return sendRateLimited(res, gate.retryAfterSeconds, "register", normalizedEmail);
   }
   await consumeAuthRateLimit(dbQuery, rateLimit);
 
