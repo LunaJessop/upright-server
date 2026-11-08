@@ -66,6 +66,7 @@ describe("route authentication", () => {
     assert.ok(adminKeys.includes("GET /api/admin/clients"));
     assert.ok(adminKeys.includes("GET /api/admin/customers"));
     assert.ok(adminKeys.includes("GET /api/admin/customers/:id"));
+    assert.ok(adminKeys.includes("GET /api/admin/customers/:id/billing"));
     assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/password-reset"));
     assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/invite"));
     assert.ok(adminKeys.includes("POST /api/admin/customers/:id/users/:userId/active"));
