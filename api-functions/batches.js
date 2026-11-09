@@ -1,5 +1,6 @@
 import { pool } from "../lib/db.js";
 import { attachBatchMaterialPhases } from "../lib/bomPhase.js";
+import { attachComponentProgress } from "../lib/batchProgress.js";
 import { expandProductionTree, isMakeItem } from "../lib/productionTree.js";
 import { computeBatchEconomics } from "../lib/pricing.js";
 import { normalizeUnit } from "../lib/units.js";
@@ -48,6 +49,12 @@ const batchesSelect = `
 `;
 
 const VALID_PHASE_STATUSES = ["pending", "in_progress", "complete", "skipped"];
+
+async function presentBatchRows(db, clientId, rows) {
+  await attachBatchMaterialPhases(db, clientId, rows);
+  await attachComponentProgress(db, clientId, rows);
+  return rows;
+}
 
 async function syncBatchStatus(dbClient, batchId) {
   const { rows: batchRows } = await dbClient.query(
@@ -159,7 +166,7 @@ export async function getBatches(req, res) {
       `${batchesSelect} WHERE b.client_id = $1 ORDER BY b.created_at DESC`,
       [clientId]
     );
-    await attachBatchMaterialPhases(pool, clientId, rows);
+    await presentBatchRows(pool, clientId, rows);
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -205,7 +212,7 @@ export async function getBatchById(req, res) {
       dbClient.release();
     }
 
-    await attachBatchMaterialPhases(pool, clientId, rows);
+    await presentBatchRows(pool, clientId, rows);
     res.json(rows[0]);
   } catch (err) {
     console.error(err);
@@ -363,7 +370,7 @@ export async function createBatch(req, res) {
       `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
       [batch.id, clientId]
     );
-    await attachBatchMaterialPhases(pool, clientId, rows);
+    await presentBatchRows(pool, clientId, rows);
     res.status(201).json(rows[0]);
   } catch (err) {
     await dbClient.query("ROLLBACK");
@@ -403,7 +410,7 @@ export async function cancelBatch(req, res) {
         `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
         [batchId, clientId]
       );
-      await attachBatchMaterialPhases(pool, clientId, rows);
+      await presentBatchRows(pool, clientId, rows);
       return res.json(rows[0]);
     }
 
@@ -425,7 +432,7 @@ export async function cancelBatch(req, res) {
       `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
       [batchId, clientId]
     );
-    await attachBatchMaterialPhases(pool, clientId, rows);
+    await presentBatchRows(pool, clientId, rows);
     res.json(rows[0]);
   } catch (err) {
     console.error(err);
@@ -488,7 +495,7 @@ export async function completeBatch(req, res) {
         `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
         [id, clientId]
       );
-      await attachBatchMaterialPhases(pool, clientId, rows);
+      await presentBatchRows(pool, clientId, rows);
       return res.json(rows[0]);
     }
 
@@ -556,7 +563,7 @@ export async function completeBatch(req, res) {
       `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
       [id, clientId]
     );
-    await attachBatchMaterialPhases(pool, clientId, rows);
+    await presentBatchRows(pool, clientId, rows);
     res.json(rows[0]);
   } catch (err) {
     await dbClient.query("ROLLBACK");
@@ -637,7 +644,7 @@ export async function updateBatchPhase(req, res) {
       `${batchesSelect} WHERE b.id = $1 AND b.client_id = $2`,
       [batchId, clientId]
     );
-    await attachBatchMaterialPhases(pool, clientId, batchRows);
+    await presentBatchRows(pool, clientId, batchRows);
     res.json(batchRows[0]);
   } catch (err) {
     await dbClient.query("ROLLBACK");

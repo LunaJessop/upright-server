@@ -279,6 +279,7 @@ describe("recipe line phase", { concurrency: 1 }, () => {
       name: "Oil",
       phase_id: 9,
       phase_name: "Mix",
+      progress: [],
     });
     assert.equal(batches.body[0].components[1].phase_id, null);
     assert.equal(batches.body[0].components[1].phase_name, null);
@@ -300,6 +301,7 @@ describe("recipe line phase", { concurrency: 1 }, () => {
     await getBatches(authReq(), res);
     assert.equal(res.body[0].components[0].phase_id, null);
     assert.equal(res.body[0].components[0].phase_name, null);
+    assert.deepEqual(res.body[0].components[0].progress, []);
     assert.equal(queries.some((sql) => sql.includes("WITH RECURSIVE")), false);
   });
 });
