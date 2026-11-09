@@ -77,6 +77,10 @@ describe("route authentication", () => {
     assert.ok(keys.includes("GET /api/onboarding/templates"));
     assert.ok(keys.includes("GET /api/onboarding/status"));
     assert.ok(keys.includes("POST /api/onboarding/apply"));
+    assert.ok(keys.includes("GET /api/items/:id/photo"));
+    assert.ok(keys.includes("POST /api/items/:id/photo"));
+    assert.ok(keys.includes("DELETE /api/items/:id/photo"));
+    assert.ok(keys.includes("PUT /api/batches/:id/components/:componentId/progress"));
     const apply = calls.find((entry) => routeKey(entry) === "POST /api/onboarding/apply");
     assert.match(apply, /requireFounder/);
     for (const key of adminKeys) {
