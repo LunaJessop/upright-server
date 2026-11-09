@@ -18,6 +18,7 @@ import {
   parsePhaseId,
   phaseNamesById,
 } from "../lib/bomPhase.js";
+import { presentItemPhoto } from "../lib/itemPhotos.js";
 import {
   buildCrossKindPreview,
   conversionCounts,
@@ -406,7 +407,7 @@ export async function getItems(req, res) {
       `${await itemSelectSql(pool)} ${where} ORDER BY i.id`,
       params
     );
-    res.json(rows);
+    res.json(rows.map(presentItemPhoto));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch items" });
@@ -427,7 +428,7 @@ export async function getItemById(req, res) {
       return res.status(404).json({ error: "Item not found" });
     }
 
-    res.json(rows[0]);
+    res.json(presentItemPhoto(rows[0]));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch item" });
@@ -553,14 +554,16 @@ export async function createItem(req, res) {
     const savedTags = await syncItemTags(dbClient, clientId, item.id, tags);
 
     await dbClient.query("COMMIT");
-    res.status(201).json({
-      ...item,
-      bom_items: savedBom,
-      item_skus: [],
-      router_phases: savedPhases,
-      tags: savedTags,
-      used_in: [],
-    });
+    res.status(201).json(
+      presentItemPhoto({
+        ...item,
+        bom_items: savedBom,
+        item_skus: [],
+        router_phases: savedPhases,
+        tags: savedTags,
+        used_in: [],
+      })
+    );
   } catch (err) {
     await dbClient.query("ROLLBACK");
     console.error(err);
@@ -734,12 +737,14 @@ export async function updateItem(req, res) {
     );
 
     res.json(
-      fullRows[0] ?? {
-        ...rows[0],
-        bom_items,
-        router_phases: savedPhases,
-        tags: savedTags,
-      }
+      presentItemPhoto(
+        fullRows[0] ?? {
+          ...rows[0],
+          bom_items,
+          router_phases: savedPhases,
+          tags: savedTags,
+        }
+      )
     );
   } catch (err) {
     await dbClient.query("ROLLBACK");
@@ -761,7 +766,7 @@ async function loadItemResponse(db, itemId, clientId) {
     `${await itemSelectSql(db)} WHERE i.id = $1 AND i.client_id = $2`,
     [itemId, clientId]
   );
-  return rows[0] ?? null;
+  return rows[0] ? presentItemPhoto(rows[0]) : null;
 }
 
 function numOrNull(value) {

@@ -5,6 +5,11 @@ import { corsOptions } from "./lib/cors.js";
 import { securityHeaders } from "./lib/securityHeaders.js";
 import express from "express";
 import { changeItemUnit, createItem, deleteItem, getItemById, getItemProductionTree, getItems, updateItem } from "./api-functions/items.js";
+import {
+  deleteItemPhoto,
+  getItemPhoto,
+  uploadItemPhoto,
+} from "./api-functions/itemPhotos.js";
 import { createBatch, getBatchById, getBatches, updateBatchPhase, cancelBatch, completeBatch } from "./api-functions/batches.js";
 import {
   createRouterPhaseTemplate,
@@ -216,6 +221,24 @@ app.get(
   getItemProductionTree
 );
 app.get("/api/items/:id", requireAuth, requireReadableSubscription, getItemById);
+app.get(
+  "/api/items/:id/photo",
+  requireAuth,
+  requireReadableSubscription,
+  getItemPhoto
+);
+app.post(
+  "/api/items/:id/photo",
+  requireAuth,
+  requireActiveSubscription,
+  uploadItemPhoto
+);
+app.delete(
+  "/api/items/:id/photo",
+  requireAuth,
+  requireActiveSubscription,
+  deleteItemPhoto
+);
 app.get(
   "/api/items/:id/inventory",
   requireAuth,
