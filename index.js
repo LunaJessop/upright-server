@@ -11,6 +11,7 @@ import {
   uploadItemPhoto,
 } from "./api-functions/itemPhotos.js";
 import { createBatch, getBatchById, getBatches, updateBatchPhase, cancelBatch, completeBatch } from "./api-functions/batches.js";
+import { saveBatchComponentProgress } from "./api-functions/batchProgress.js";
 import {
   createRouterPhaseTemplate,
   deleteRouterPhaseTemplate,
@@ -294,6 +295,12 @@ app.get(
   getBatchById
 );
 app.post("/api/batches", requireAuth, requireActiveSubscription, createBatch);
+app.put(
+  "/api/batches/:id/components/:componentId/progress",
+  requireAuth,
+  requireActiveSubscription,
+  saveBatchComponentProgress
+);
 app.post(
   "/api/batches/:id/cancel",
   requireAuth,
