@@ -6,9 +6,9 @@ import { securityHeaders } from "./lib/securityHeaders.js";
 import express from "express";
 import { changeItemUnit, createItem, deleteItem, getItemById, getItemProductionTree, getItems, updateItem } from "./api-functions/items.js";
 import {
-  createItemPhotoUpload,
   deleteItemPhoto,
-  saveItemPhoto,
+  getItemPhoto,
+  uploadItemPhoto,
 } from "./api-functions/itemPhotos.js";
 import { createBatch, getBatchById, getBatches, updateBatchPhase, cancelBatch, completeBatch } from "./api-functions/batches.js";
 import {
@@ -221,17 +221,17 @@ app.get(
   getItemProductionTree
 );
 app.get("/api/items/:id", requireAuth, requireReadableSubscription, getItemById);
-app.post(
-  "/api/items/:id/photo/upload",
+app.get(
+  "/api/items/:id/photo",
   requireAuth,
-  requireActiveSubscription,
-  createItemPhotoUpload
+  requireReadableSubscription,
+  getItemPhoto
 );
 app.post(
   "/api/items/:id/photo",
   requireAuth,
   requireActiveSubscription,
-  saveItemPhoto
+  uploadItemPhoto
 );
 app.delete(
   "/api/items/:id/photo",
