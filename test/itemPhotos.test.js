@@ -11,13 +11,18 @@ delete process.env.CLOUDINARY_URL;
 const { pool } = await import("../lib/db.js");
 const {
   ITEM_PHOTO_MAX_EDGE,
+  ITEM_PHOTO_THUMB_EDGE,
   ITEM_PHOTO_MAX_INCOMING_BYTES,
   ITEM_PHOTO_UPLOADS_PER_WINDOW,
+  ifNoneMatchSatisfied,
+  itemPhotoEtag,
+  itemPhotoVersion,
+  presentItemPhoto,
   resetItemPhotosForTests,
   setPhotoStorageForTests,
   sniffPhoto,
 } = await import("../lib/itemPhotos.js");
-const { deleteItemPhoto, getItemPhoto, uploadItemPhoto } = await import(
+const { deleteItemPhoto, getItemPhoto, getItemPhotoThumb, uploadItemPhoto } = await import(
   "../api-functions/itemPhotos.js"
 );
 const { getItemById } = await import("../api-functions/items.js");
@@ -73,7 +78,7 @@ function photoRequest(buffer, headers = {}) {
   };
 }
 
-function installStorage() {
+function installStorage(downloadBytes) {
   const calls = { uploads: [], destroyed: [], downloads: [] };
   setPhotoStorageForTests({
     async upload(buffer, publicId) {
@@ -94,13 +99,18 @@ function installStorage() {
     },
     async download(publicId) {
       calls.downloads.push(publicId);
-      return Buffer.from("webp-bytes");
+      return downloadBytes ?? Buffer.from("webp-bytes");
     },
   });
   return calls;
 }
 
-function installDb({ item = { id: 10, image_public_id: null }, columns = true, failUpdate = false } = {}) {
+function installDb({
+  item = { id: 10, image_public_id: null },
+  columns = true,
+  failUpdate = false,
+  enforceOwner = false,
+} = {}) {
   const queries = [];
   pool.query = async (sql, params = []) => {
     const text = String(sql);
@@ -124,7 +134,10 @@ function installDb({ item = { id: 10, image_public_id: null }, columns = true, f
       };
     }
     if (text.includes("UPDATE items")) return { rows: [], rowCount: 1 };
-    if (text.includes("FROM items")) return { rows: item ? [item] : [] };
+    if (text.includes("FROM items")) {
+      if (enforceOwner && params[1] !== 4) return { rows: [] };
+      return { rows: item ? [item] : [] };
+    }
     throw new Error(text);
   };
   return queries;
@@ -186,6 +199,9 @@ describe("item photo gateway", { concurrency: 1 }, () => {
     assert.ok(res.body.photo.height <= ITEM_PHOTO_MAX_EDGE);
     assert.equal(res.body.photo.format, "webp");
     assert.equal(res.body.photo.url, undefined);
+    assert.match(res.body.photo.version, /^[a-f0-9]{64}$/);
+    assert.equal(res.body.photo.version, itemPhotoVersion(calls.uploads[0].publicId));
+    assert.equal(JSON.stringify(res.body).includes(calls.uploads[0].publicId), false);
     assert.equal(JSON.stringify(res.body).includes(SECRET), false);
     const update = queries.find((query) => query.sql.includes("image_public_id = $1"));
     assert.equal(/name\s*=/.test(update.sql), false);
@@ -284,6 +300,7 @@ describe("item photo gateway", { concurrency: 1 }, () => {
     await getItemPhoto({ auth: { clientId: 4, userId: 9 }, params: { id: "10" } }, res);
     assert.equal(res.statusCode, 200);
     assert.equal(res.headers["cache-control"], "private, no-store");
+    assert.equal(res.headers["etag"], undefined);
     assert.equal(res.headers["content-type"], "image/webp");
     assert.equal(Buffer.compare(res.ended, Buffer.from("webp-bytes")), 0);
     assert.deepEqual(calls.downloads, [publicId]);
@@ -310,7 +327,191 @@ describe("item photo gateway", { concurrency: 1 }, () => {
     assert.equal(item.body.image_public_id, undefined);
     assert.equal(item.body.photo.url, undefined);
     assert.equal(item.body.photo.width, 800);
+    assert.equal(item.body.photo.version, itemPhotoVersion(publicId));
+    assert.equal(JSON.stringify(item.body).includes(publicId), false);
     assert.equal(JSON.stringify(item.body).includes(SECRET), false);
+  });
+
+  it("returns 404 for a thumbnail the company does not own or that has no photo", async () => {
+    resetItemPhotosForTests();
+    const calls = installStorage();
+    const publicId = "c/4/items/10/" + "e".repeat(32);
+    const queries = installDb({
+      item: { id: 10, image_public_id: publicId, image_format: "webp" },
+      enforceOwner: true,
+    });
+
+    const otherCompany = mockRes();
+    await getItemPhotoThumb(
+      { auth: { clientId: 9, userId: 3 }, params: { id: "10" }, headers: {} },
+      otherCompany
+    );
+    assert.equal(otherCompany.statusCode, 404);
+    assert.equal(otherCompany.body.error, "This item has no photo.");
+    assert.deepEqual(calls.downloads, []);
+
+    const ownedRead = queries.find((query) => query.sql.includes("FROM items"));
+    assert.match(ownedRead.sql, /client_id/);
+    assert.deepEqual(ownedRead.params, [10, 9]);
+
+    resetItemPhotosForTests();
+    const wrongId = installStorage();
+    installDb({
+      item: { id: 10, image_public_id: "c/9/items/10/" + "f".repeat(32), image_format: "webp" },
+    });
+    const mismatched = mockRes();
+    await getItemPhotoThumb(
+      { auth: { clientId: 4, userId: 9 }, params: { id: "10" }, headers: {} },
+      mismatched
+    );
+    assert.equal(mismatched.statusCode, 404);
+    assert.deepEqual(wrongId.downloads, []);
+
+    resetItemPhotosForTests();
+    const bare = installStorage();
+    installDb({ item: { id: 10, image_public_id: null } });
+    const missing = mockRes();
+    await getItemPhotoThumb(
+      { auth: { clientId: 4, userId: 9 }, params: { id: "10" }, headers: {} },
+      missing
+    );
+    assert.equal(missing.statusCode, 404);
+    assert.equal(missing.body.error, "This item has no photo.");
+    assert.deepEqual(bare.downloads, []);
+
+    const invalid = mockRes();
+    await getItemPhotoThumb(
+      { auth: { clientId: 4, userId: 9 }, params: { id: "nope" }, headers: {} },
+      invalid
+    );
+    assert.equal(invalid.statusCode, 400);
+  });
+
+  it("serves a small cached thumbnail and a new version after the photo is replaced", async () => {
+    resetItemPhotosForTests();
+    const original = await sharp({
+      create: {
+        width: 180,
+        height: 60,
+        channels: 3,
+        background: { r: 10, g: 120, b: 200 },
+      },
+    })
+      .webp()
+      .toBuffer();
+    const calls = installStorage(original);
+    const firstId = "c/4/items/10/" + "a".repeat(32);
+    const secondId = "c/4/items/10/" + "b".repeat(32);
+    const item = { id: 10, image_public_id: firstId, image_format: "jpeg" };
+    installDb({ item });
+
+    const full = mockRes();
+    await getItemPhoto(
+      { auth: { clientId: 4, userId: 9 }, params: { id: "10" }, headers: {} },
+      full
+    );
+    assert.equal(full.headers["cache-control"], "private, no-store");
+    assert.equal(full.headers["etag"], undefined);
+    assert.equal(Buffer.compare(full.ended, original), 0);
+
+    const thumb = mockRes();
+    await getItemPhotoThumb(
+      { auth: { clientId: 4, userId: 9 }, params: { id: "10" }, headers: {} },
+      thumb
+    );
+    assert.equal(thumb.statusCode, 200);
+    assert.equal(thumb.headers["content-type"], "image/webp");
+    assert.equal(thumb.headers["cache-control"], "private, max-age=300");
+    assert.equal(thumb.headers["vary"], "Authorization");
+    assert.equal(thumb.headers["x-content-type-options"], "nosniff");
+    assert.equal(thumb.headers["etag"], itemPhotoEtag(firstId));
+    assert.equal(thumb.headers["etag"].includes(firstId), false);
+    const meta = await sharp(thumb.ended).metadata();
+    assert.equal(meta.width, ITEM_PHOTO_THUMB_EDGE);
+    assert.equal(meta.height, ITEM_PHOTO_THUMB_EDGE);
+    assert.equal(meta.format, "webp");
+    assert.notEqual(Buffer.compare(thumb.ended, original), 0);
+    assert.equal(thumb.ended.includes(Buffer.from(firstId)), false);
+    assert.equal(JSON.stringify(thumb.headers).includes("res.cloudinary.com"), false);
+    assert.equal(JSON.stringify(thumb.headers).includes(SECRET), false);
+    assert.deepEqual(calls.downloads, [firstId, firstId]);
+
+    const fresh = mockRes();
+    await getItemPhotoThumb(
+      {
+        auth: { clientId: 4, userId: 9 },
+        params: { id: "10" },
+        headers: { "if-none-match": '"not-the-etag"' },
+      },
+      fresh
+    );
+    assert.equal(fresh.statusCode, 200);
+    assert.equal(calls.downloads.length, 3);
+
+    const cached = mockRes();
+    await getItemPhotoThumb(
+      {
+        auth: { clientId: 4, userId: 9 },
+        params: { id: "10" },
+        headers: { "if-none-match": `W/${thumb.headers.etag}, "other"` },
+      },
+      cached
+    );
+    assert.equal(cached.statusCode, 304);
+    assert.equal(cached.headers["cache-control"], "private, max-age=300");
+    assert.equal(cached.headers["vary"], "Authorization");
+    assert.equal(cached.headers["etag"], thumb.headers.etag);
+    assert.equal(cached.ended, undefined);
+    assert.equal(calls.downloads.length, 3);
+    assert.equal(ifNoneMatchSatisfied("*", thumb.headers.etag), true);
+
+    const firstVersion = presentItemPhoto({
+      image_public_id: firstId,
+      image_width: 180,
+      image_height: 60,
+      image_bytes: original.length,
+      image_format: "webp",
+    }).photo.version;
+    item.image_public_id = secondId;
+    const replaced = mockRes();
+    await getItemPhotoThumb(
+      { auth: { clientId: 4, userId: 9 }, params: { id: "10" }, headers: {} },
+      replaced
+    );
+    const secondVersion = presentItemPhoto({
+      image_public_id: secondId,
+      image_width: 180,
+      image_height: 60,
+      image_bytes: original.length,
+      image_format: "webp",
+    }).photo.version;
+    assert.match(firstVersion, /^[a-f0-9]{64}$/);
+    assert.notEqual(firstVersion, secondVersion);
+    assert.equal(firstVersion.includes(firstId), false);
+    assert.equal(replaced.headers["etag"], itemPhotoEtag(secondId));
+    assert.notEqual(replaced.headers["etag"], thumb.headers.etag);
+    assert.equal(calls.downloads.at(-1), secondId);
+    assert.equal(JSON.stringify(replaced.headers).includes(secondId), false);
+    assert.equal(presentItemPhoto({ image_public_id: null }).photo, null);
+  });
+
+  it("does not cache a thumbnail it could not build", async () => {
+    resetItemPhotosForTests();
+    const publicId = "c/4/items/10/" + "d".repeat(32);
+    installStorage(Buffer.from("not-a-photo"));
+    installDb({
+      item: { id: 10, image_public_id: publicId, image_format: "webp" },
+    });
+    const res = mockRes();
+    await getItemPhotoThumb(
+      { auth: { clientId: 4, userId: 9 }, params: { id: "10" }, headers: {} },
+      res
+    );
+    assert.equal(res.statusCode, 502);
+    assert.equal(res.headers["cache-control"], undefined);
+    assert.equal(res.ended, undefined);
+    assert.equal(JSON.stringify(res.body).includes(publicId), false);
+    assert.equal(JSON.stringify(res.body).includes("res.cloudinary.com"), false);
   });
 
   it("limits uploads in this process only", async () => {

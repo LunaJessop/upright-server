@@ -2,12 +2,15 @@ import { pool } from "../lib/db.js";
 import {
   consumePhotoUpload,
   itemPhotoColumnsReady,
+  ifNoneMatchSatisfied,
+  itemPhotoEtag,
   itemPhotoPublicId,
   itemPhotoPublicIdMatches,
   photoStorage,
   prepareItemPhoto,
   presentItemPhoto,
   readPhotoBody,
+  renderItemPhotoThumb,
   storedPhotoIsSafe,
 } from "../lib/itemPhotos.js";
 
@@ -182,6 +185,48 @@ export async function getItemPhoto(req, res) {
     res.setHeader("Cache-Control", "private, no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.end(bytes);
+  } catch {
+    console.error("photo read failed");
+    res.status(502).json({ error: "The photo could not be loaded. Try again." });
+  }
+}
+
+function setThumbCacheHeaders(res, etag) {
+  res.setHeader("Cache-Control", "private, max-age=300");
+  res.setHeader("ETag", etag);
+  res.setHeader("Vary", "Authorization");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+}
+
+export async function getItemPhotoThumb(req, res) {
+  const itemId = itemIdFrom(req);
+  if (!itemId) return res.status(400).json({ error: "Invalid item id" });
+  const { clientId } = req.auth;
+
+  try {
+    if (!(await itemPhotoColumnsReady(pool))) return storageUnavailable(res);
+    const item = await ownedItem(clientId, itemId);
+    if (!item?.image_public_id) {
+      return res.status(404).json({ error: "This item has no photo." });
+    }
+    if (!itemPhotoPublicIdMatches(item.image_public_id, clientId, itemId)) {
+      return res.status(404).json({ error: "This item has no photo." });
+    }
+    const etag = itemPhotoEtag(item.image_public_id);
+    if (!etag) return res.status(404).json({ error: "This item has no photo." });
+
+    const storage = photoStorage();
+    if (!storage) return storageUnconfigured(res);
+    if (ifNoneMatchSatisfied(req.headers?.["if-none-match"], etag)) {
+      setThumbCacheHeaders(res, etag);
+      return res.status(304).end();
+    }
+
+    const bytes = await storage.download(item.image_public_id, item.image_format || "webp");
+    const thumb = await renderItemPhotoThumb(bytes);
+    res.setHeader("Content-Type", "image/webp");
+    setThumbCacheHeaders(res, etag);
+    res.end(thumb);
   } catch {
     console.error("photo read failed");
     res.status(502).json({ error: "The photo could not be loaded. Try again." });
