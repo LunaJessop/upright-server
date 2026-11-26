@@ -4,6 +4,7 @@ import { attachComponentProgress } from "../lib/batchProgress.js";
 import { expandProductionTree, isMakeItem } from "../lib/productionTree.js";
 import { computeBatchEconomics } from "../lib/pricing.js";
 import { normalizeUnit } from "../lib/units.js";
+import { recordStockDelta } from "../lib/inventoryTransactions.js";
 
 const batchesSelect = `
   SELECT b.*,
@@ -440,19 +441,6 @@ export async function cancelBatch(req, res) {
   }
 }
 
-async function adjustInventoryQuantity(dbClient, clientId, itemId, delta) {
-  const amount = Number(delta);
-  if (!Number.isFinite(amount) || amount === 0) return;
-
-  await dbClient.query(
-    `INSERT INTO inventory (client_id, item_id, quantity, updated_at)
-     VALUES ($1, $2, GREATEST(0::numeric, $3::numeric), CURRENT_TIMESTAMP)
-     ON CONFLICT (client_id, item_id)
-     DO UPDATE SET quantity = GREATEST(0::numeric, inventory.quantity + $3::numeric),
-                   updated_at = CURRENT_TIMESTAMP`,
-    [clientId, itemId, amount]
-  );
-}
 
 /**
  * Master complete: lock batch, post inventory once.
@@ -473,7 +461,7 @@ export async function completeBatch(req, res) {
     await dbClient.query("BEGIN");
 
     const { rows: owned } = await dbClient.query(
-      `SELECT id, item_id, quantity, status, inventory_posted
+      `SELECT id, item_id, quantity, sku, status, inventory_posted
        FROM batches
        WHERE id = $1 AND client_id = $2
        FOR UPDATE`,
@@ -522,12 +510,24 @@ export async function completeBatch(req, res) {
       return res.status(400).json({ error: "Batch quantity is invalid" });
     }
 
-    // Credit finished goods
-    await adjustInventoryQuantity(dbClient, clientId, batch.item_id, qty);
+    const batchLabel = batch.sku ? `batch ${batch.sku}` : "a batch";
 
-    // Debit purchased materials allocated to this batch
+    // Credit finished goods. Log the amount that was actually stored.
+    await recordStockDelta(dbClient, {
+      clientId,
+      itemId: batch.item_id,
+      delta: qty,
+      reason: "production",
+      source: "batch_complete",
+      batchId: id,
+      userId,
+      note: `Completed ${batchLabel}`,
+    });
+
+    // Debit purchased materials allocated to this batch.
+    // Nested make lines are production steps, not stock pulls.
     const { rows: components } = await dbClient.query(
-      `SELECT bc.item_id, bc.quantity_allocated, i.make_or_buy
+      `SELECT bc.item_id, bc.quantity_allocated, i.make_or_buy, i.unit_of_measure
        FROM batch_components bc
        JOIN items i ON i.id = bc.item_id AND i.client_id = $2
        WHERE bc.batch_id = $1`,
@@ -538,12 +538,17 @@ export async function completeBatch(req, res) {
       if (isMakeItem(component.make_or_buy)) continue;
       const allocated = Number(component.quantity_allocated);
       if (!Number.isFinite(allocated) || allocated <= 0) continue;
-      await adjustInventoryQuantity(
-        dbClient,
+      await recordStockDelta(dbClient, {
         clientId,
-        component.item_id,
-        -allocated
-      );
+        itemId: component.item_id,
+        delta: -allocated,
+        reason: "materials_used",
+        source: "batch_complete",
+        batchId: id,
+        userId,
+        unitOfMeasure: component.unit_of_measure ?? null,
+        note: `Used for ${batchLabel}`,
+      });
     }
 
     await dbClient.query(

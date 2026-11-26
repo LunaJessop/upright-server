@@ -1,5 +1,6 @@
 import { pool } from "../lib/db.js";
 import { isMakeItem } from "../lib/productionTree.js";
+import { recordStockDelta } from "../lib/inventoryTransactions.js";
 
 const lotSelect = `
   SELECT
@@ -28,7 +29,7 @@ function parseArrivalDate(raw) {
 
 async function loadBuyItem(db, itemId, clientId) {
   const { rows } = await db.query(
-    `SELECT id, make_or_buy, unit_cost, default_unit_price
+    `SELECT id, make_or_buy, unit_of_measure, unit_cost, default_unit_price
      FROM items
      WHERE id = $1 AND client_id = $2`,
     [itemId, clientId]
@@ -41,20 +42,6 @@ async function loadBuyItem(db, itemId, clientId) {
     });
   }
   return item;
-}
-
-async function adjustInventoryQuantity(dbClient, clientId, itemId, delta) {
-  const amount = Number(delta);
-  if (!Number.isFinite(amount) || amount === 0) return;
-
-  await dbClient.query(
-    `INSERT INTO inventory (client_id, item_id, quantity, updated_at)
-     VALUES ($1, $2, GREATEST(0::numeric, $3::numeric), CURRENT_TIMESTAMP)
-     ON CONFLICT (client_id, item_id)
-     DO UPDATE SET quantity = GREATEST(0::numeric, inventory.quantity + $3::numeric),
-                   updated_at = CURRENT_TIMESTAMP`,
-    [clientId, itemId, amount]
-  );
 }
 
 async function syncItemUnitCostFromLots(dbClient, clientId, itemId) {
@@ -181,7 +168,18 @@ export async function createPurchaseLot(req, res) {
       ]
     );
 
-    await adjustInventoryQuantity(dbClient, clientId, itemId, quantity);
+    await recordStockDelta(dbClient, {
+      clientId,
+      itemId,
+      delta: quantity,
+      reason: "received",
+      source: "purchase_lot",
+      purchaseLotId: rows[0].id,
+      userId,
+      unitOfMeasure: item.unit_of_measure ?? null,
+      occurredOn: arrivalDate,
+      note: `Received vendor lot ${lotNumber}`,
+    });
     await dbClient.query(
       `UPDATE items
        SET unit_cost = $1,
@@ -229,7 +227,7 @@ export async function deletePurchaseLot(req, res) {
     }
 
     const { rows: owned } = await dbClient.query(
-      `SELECT id, quantity
+      `SELECT id, quantity, lot_number
        FROM purchase_lots
        WHERE id = $1 AND item_id = $2 AND client_id = $3
        FOR UPDATE`,
@@ -241,7 +239,20 @@ export async function deletePurchaseLot(req, res) {
     }
 
     const qty = Number(owned[0].quantity);
-    await adjustInventoryQuantity(dbClient, clientId, itemId, -qty);
+    const lotNumber = owned[0].lot_number ? String(owned[0].lot_number) : "";
+    // Write the row before the lot is deleted. The foreign key then clears
+    // purchase_lot_id, and the note keeps the vendor lot number.
+    await recordStockDelta(dbClient, {
+      clientId,
+      itemId,
+      delta: -qty,
+      reason: "adjustment",
+      source: "purchase_lot",
+      purchaseLotId,
+      userId: req.auth.userId,
+      unitOfMeasure: item.unit_of_measure ?? null,
+      note: lotNumber ? `Removed vendor lot ${lotNumber}` : "Removed a vendor lot",
+    });
     await dbClient.query(
       `DELETE FROM purchase_lots WHERE id = $1 AND client_id = $2`,
       [purchaseLotId, clientId]

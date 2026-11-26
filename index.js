@@ -32,6 +32,10 @@ import {
   updateItemInventoryGoal,
 } from "./api-functions/inventory.js";
 import {
+  createInventoryTransaction,
+  listInventoryTransactions,
+} from "./api-functions/inventoryTransactions.js";
+import {
   createPurchaseLot,
   deletePurchaseLot,
   getPurchaseLotsForItem,
@@ -258,6 +262,18 @@ app.put(
   requireActiveSubscription,
   requireAdminOrFounder,
   updateItemInventoryGoal
+);
+app.get(
+  "/api/items/:id/inventory/transactions",
+  requireAuth,
+  requireReadableSubscription,
+  listInventoryTransactions
+);
+app.post(
+  "/api/items/:id/inventory/transactions",
+  requireAuth,
+  requireActiveSubscription,
+  createInventoryTransaction
 );
 app.get(
   "/api/items/:id/purchase-lots",

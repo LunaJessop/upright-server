@@ -19,6 +19,7 @@ import {
   phaseNamesById,
 } from "../lib/bomPhase.js";
 import { presentItemPhoto } from "../lib/itemPhotos.js";
+import { restateInventoryHistory } from "../lib/inventoryTransactions.js";
 import {
   buildCrossKindPreview,
   conversionCounts,
@@ -892,7 +893,7 @@ async function writeUnitOnly(db, itemId, clientId, nextUnit) {
   );
 }
 
-async function writeCrossKindConversion(db, clientId, itemId, fromUnit, nextUnit, factor, snapshot) {
+async function writeCrossKindConversion(db, clientId, itemId, fromUnit, nextUnit, factor, snapshot, userId) {
   await db.query(
     `UPDATE inventory
      SET quantity = quantity / $1::numeric,
@@ -900,6 +901,15 @@ async function writeCrossKindConversion(db, clientId, itemId, fromUnit, nextUnit
      WHERE client_id = $2 AND item_id = $3`,
     [factor, clientId, itemId]
   );
+  await restateInventoryHistory(db, {
+    clientId,
+    itemId,
+    userId,
+    factor,
+    mode: "divide",
+    fromUnit,
+    nextUnit,
+  });
   await db.query(
     `UPDATE item_inventory_goals
      SET goal_min = goal_min / $1::numeric,
@@ -1003,7 +1013,7 @@ async function writeCrossKindConversion(db, clientId, itemId, fromUnit, nextUnit
 }
 
 async function respondCrossKindUnitChange(db, res, input) {
-  const { clientId, itemId, previous, nextUnit, prices, body } = input;
+  const { clientId, itemId, userId, previous, nextUnit, prices, body } = input;
   const snapshot = await loadCrossKindSnapshot(db, clientId, itemId, prices);
   const incompatible = incompatibleRecipeLines(snapshot.ingredientLines, previous);
   if (incompatible.length > 0) {
@@ -1071,7 +1081,8 @@ async function respondCrossKindUnitChange(db, res, input) {
       previous,
       nextUnit,
       factor,
-      snapshot
+      snapshot,
+      userId
     );
   }
 
@@ -1118,7 +1129,7 @@ export async function changeItemUnit(req, res) {
     });
   }
   const nextUnit = unitResult.unit;
-  const { clientId } = req.auth;
+  const { clientId, userId } = req.auth;
 
   const dbClient = await pool.connect();
   try {
@@ -1157,6 +1168,7 @@ export async function changeItemUnit(req, res) {
       if (!unitsAreCompatible(previous, nextUnit)) {
         await respondCrossKindUnitChange(dbClient, res, {
           clientId,
+          userId,
           itemId,
           previous,
           nextUnit,
@@ -1205,6 +1217,15 @@ export async function changeItemUnit(req, res) {
          WHERE client_id = $2 AND item_id = $3`,
         [factor, clientId, itemId]
       );
+      await restateInventoryHistory(dbClient, {
+        clientId,
+        itemId,
+        userId,
+        factor,
+        mode: "multiply",
+        fromUnit: previous,
+        nextUnit,
+      });
       await dbClient.query(
         `UPDATE item_inventory_goals
          SET goal_min = goal_min * $1::numeric,
