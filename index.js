@@ -19,6 +19,13 @@ import {
   updateRouterPhaseTemplate,
 } from "./api-functions/routerPhases.js";
 import {
+  createRouter,
+  deleteRouter,
+  getRouter,
+  listRouters,
+  updateRouter,
+} from "./api-functions/clientRouters.js";
+import {
   createVendor,
   deleteVendor,
   getVendors,
@@ -359,6 +366,27 @@ app.delete(
   requireAuth,
   requireActiveSubscription,
   deleteRouterPhaseTemplate
+);
+
+app.get("/api/routers", requireAuth, requireReadableSubscription, listRouters);
+app.post("/api/routers", requireAuth, requireActiveSubscription, createRouter);
+app.get(
+  "/api/routers/:id",
+  requireAuth,
+  requireReadableSubscription,
+  getRouter
+);
+app.put(
+  "/api/routers/:id",
+  requireAuth,
+  requireActiveSubscription,
+  updateRouter
+);
+app.delete(
+  "/api/routers/:id",
+  requireAuth,
+  requireActiveSubscription,
+  deleteRouter
 );
 
 app.get("/api/vendors", requireAuth, requireReadableSubscription, getVendors);
