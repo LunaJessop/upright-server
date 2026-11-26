@@ -257,9 +257,10 @@ describe("recipe line phase", { concurrency: 1 }, () => {
     const items = mockRes();
     await getItems(authReq(undefined, { query: {} }), items);
     assert.equal(items.statusCode, 200);
-    assert.match(queries[1], /'phase_id', b\.phase_id/);
-    assert.match(queries[1], /'phase_name', ph\.name/);
-    assert.match(queries[1], /ph\.client_id = i\.client_id/);
+    const itemSql = queries.find((sql) => sql.includes("AS router_phases"));
+    assert.match(itemSql, /'phase_id', b\.phase_id/);
+    assert.match(itemSql, /'phase_name', ph\.name/);
+    assert.match(itemSql, /ph\.client_id = i\.client_id/);
     assert.equal(items.body[0].bom_items[0].phase_name, "Mix");
 
     const again = mockRes();

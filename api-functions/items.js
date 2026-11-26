@@ -18,6 +18,11 @@ import {
   parsePhaseId,
   phaseNamesById,
 } from "../lib/bomPhase.js";
+import {
+  readSourceRouterInput,
+  resolveSourceRouter,
+  sourceRouterColumnReady,
+} from "../lib/clientRouters.js";
 import { presentItemPhoto } from "../lib/itemPhotos.js";
 import { restateInventoryHistory } from "../lib/inventoryTransactions.js";
 import {
@@ -61,7 +66,14 @@ function bomItemsSelect(withPhase) {
     ) AS bom_items`;
 }
 
-function itemsSelect(withPhase) {
+function sourceRouterSelect(withSource) {
+  if (!withSource) return "NULL::integer AS source_router_id";
+  return `(SELECT src.source_router_id
+       FROM item_routers src
+       WHERE src.item_id = i.id AND src.client_id = i.client_id) AS source_router_id`;
+}
+
+function itemsSelect(withPhase, withSource) {
   return `
   SELECT i.*,
     v.name AS vendor_name,
@@ -112,14 +124,17 @@ function itemsSelect(withPhase) {
        JOIN item_routers r ON r.id = p.router_id
        WHERE r.item_id = i.id AND r.client_id = i.client_id),
       '[]'::json
-    ) AS router_phases
+    ) AS router_phases,
+    ${sourceRouterSelect(withSource)}
   FROM items i
   LEFT JOIN vendors v ON v.id = i.vendor AND v.client_id = i.client_id
 `;
 }
 
 async function itemSelectSql(db = pool) {
-  return itemsSelect(await hasBomPhaseColumn(db));
+  const withPhase = await hasBomPhaseColumn(db);
+  const withSource = await sourceRouterColumnReady(db);
+  return itemsSelect(withPhase, withSource);
 }
 
 function isMakeItem(makeOrBuy) {
@@ -174,12 +189,16 @@ async function detachBatchPhasesFromItemRouter(dbClient, itemId) {
   );
 }
 
-async function replaceRouterPhases(dbClient, clientId, itemId, routerPhases) {
+async function replaceRouterPhases(dbClient, clientId, itemId, routerPhases, source) {
+  const resolved = await resolveSourceRouter(dbClient, clientId, source);
   if (!Array.isArray(routerPhases) || routerPhases.length === 0) {
     await detachBatchPhasesFromItemRouter(dbClient, itemId);
     await dbClient.query("DELETE FROM item_routers WHERE item_id = $1", [itemId]);
-    return [];
+    return { phases: [], sourceRouterId: null };
   }
+
+  const persistSource = resolved.mode === "set" && (await sourceRouterColumnReady(dbClient));
+  const sourceRouterId = persistSource ? resolved.id : null;
 
   const existing = await dbClient.query(
     "SELECT id FROM item_routers WHERE item_id = $1",
@@ -194,6 +213,21 @@ async function replaceRouterPhases(dbClient, clientId, itemId, routerPhases) {
     await dbClient.query("DELETE FROM item_router_phases WHERE router_id = $1", [
       routerId,
     ]);
+    if (persistSource) {
+      await dbClient.query(
+        `UPDATE item_routers
+         SET source_router_id = $1
+         WHERE id = $2 AND client_id = $3`,
+        [sourceRouterId, routerId, clientId]
+      );
+    }
+  } else if (persistSource) {
+    const { rows } = await dbClient.query(
+      `INSERT INTO item_routers (client_id, item_id, source_router_id)
+       VALUES ($1, $2, $3) RETURNING id`,
+      [clientId, itemId, sourceRouterId]
+    );
+    routerId = rows[0].id;
   } else {
     const { rows } = await dbClient.query(
       `INSERT INTO item_routers (client_id, item_id)
@@ -226,12 +260,7 @@ async function replaceRouterPhases(dbClient, clientId, itemId, routerPhases) {
     inserted.push(rows[0]);
   }
 
-  return inserted;
-}
-
-async function clearItemRouter(dbClient, itemId) {
-  await detachBatchPhasesFromItemRouter(dbClient, itemId);
-  await dbClient.query("DELETE FROM item_routers WHERE item_id = $1", [itemId]);
+  return { phases: inserted, sourceRouterId };
 }
 
 function storedBomUnit(existingBom, componentId, rawLineUnit) {
@@ -491,6 +520,10 @@ export async function createItem(req, res) {
   if (validationError) {
     return res.status(400).json({ error: validationError });
   }
+  const sourceInput = readSourceRouterInput(req.body);
+  if (sourceInput.error) {
+    return res.status(400).json({ error: sourceInput.error });
+  }
 
   const pricing = resolveItemPricing(make_or_buy, {
     default_unit_price,
@@ -548,9 +581,13 @@ export async function createItem(req, res) {
       phaseColumn
     );
 
-    const savedPhases = isMakeItem(make_or_buy)
-      ? await replaceRouterPhases(dbClient, clientId, item.id, router_phases)
-      : await clearItemRouter(dbClient, item.id).then(() => []);
+    const savedRouter = await replaceRouterPhases(
+      dbClient,
+      clientId,
+      item.id,
+      isMakeItem(make_or_buy) ? router_phases : [],
+      sourceInput
+    );
 
     const savedTags = await syncItemTags(dbClient, clientId, item.id, tags);
 
@@ -560,7 +597,8 @@ export async function createItem(req, res) {
         ...item,
         bom_items: savedBom,
         item_skus: [],
-        router_phases: savedPhases,
+        router_phases: savedRouter.phases,
+        source_router_id: savedRouter.sourceRouterId,
         tags: savedTags,
         used_in: [],
       })
@@ -617,6 +655,10 @@ export async function updateItem(req, res) {
   });
   if (validationError) {
     return res.status(400).json({ error: validationError });
+  }
+  const sourceInput = readSourceRouterInput(req.body);
+  if (sourceInput.error) {
+    return res.status(400).json({ error: sourceInput.error });
   }
 
   const pricing = resolveItemPricing(make_or_buy, {
@@ -724,9 +766,13 @@ export async function updateItem(req, res) {
       phaseColumn
     );
 
-    const savedPhases = isMakeItem(make_or_buy)
-      ? await replaceRouterPhases(dbClient, clientId, id, router_phases)
-      : await clearItemRouter(dbClient, id).then(() => []);
+    const savedRouter = await replaceRouterPhases(
+      dbClient,
+      clientId,
+      id,
+      isMakeItem(make_or_buy) ? router_phases : [],
+      sourceInput
+    );
 
     const savedTags = await syncItemTags(dbClient, clientId, Number(id), tags);
 
@@ -742,7 +788,8 @@ export async function updateItem(req, res) {
         fullRows[0] ?? {
           ...rows[0],
           bom_items,
-          router_phases: savedPhases,
+          router_phases: savedRouter.phases,
+          source_router_id: savedRouter.sourceRouterId,
           tags: savedTags,
         }
       )
