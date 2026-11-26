@@ -8,6 +8,7 @@ import { changeItemUnit, createItem, deleteItem, getItemById, getItemProductionT
 import {
   deleteItemPhoto,
   getItemPhoto,
+  getItemPhotoThumb,
   uploadItemPhoto,
 } from "./api-functions/itemPhotos.js";
 import { createBatch, getBatchById, getBatches, updateBatchPhase, cancelBatch, completeBatch } from "./api-functions/batches.js";
@@ -233,6 +234,12 @@ app.get(
   getItemProductionTree
 );
 app.get("/api/items/:id", requireAuth, requireReadableSubscription, getItemById);
+app.get(
+  "/api/items/:id/photo/thumb",
+  requireAuth,
+  requireReadableSubscription,
+  getItemPhotoThumb
+);
 app.get(
   "/api/items/:id/photo",
   requireAuth,
