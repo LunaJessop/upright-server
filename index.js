@@ -8,6 +8,7 @@ import { changeItemUnit, createItem, deleteItem, getItemById, getItemProductionT
 import {
   deleteItemPhoto,
   getItemPhoto,
+  getItemPhotoThumb,
   uploadItemPhoto,
 } from "./api-functions/itemPhotos.js";
 import { createBatch, getBatchById, getBatches, updateBatchPhase, cancelBatch, completeBatch } from "./api-functions/batches.js";
@@ -18,6 +19,13 @@ import {
   getRouterPhaseTemplates,
   updateRouterPhaseTemplate,
 } from "./api-functions/routerPhases.js";
+import {
+  createRouter,
+  deleteRouter,
+  getRouter,
+  listRouters,
+  updateRouter,
+} from "./api-functions/clientRouters.js";
 import {
   createVendor,
   deleteVendor,
@@ -31,6 +39,10 @@ import {
   updateItemInventory,
   updateItemInventoryGoal,
 } from "./api-functions/inventory.js";
+import {
+  createInventoryTransaction,
+  listInventoryTransactions,
+} from "./api-functions/inventoryTransactions.js";
 import {
   createPurchaseLot,
   deletePurchaseLot,
@@ -223,6 +235,12 @@ app.get(
 );
 app.get("/api/items/:id", requireAuth, requireReadableSubscription, getItemById);
 app.get(
+  "/api/items/:id/photo/thumb",
+  requireAuth,
+  requireReadableSubscription,
+  getItemPhotoThumb
+);
+app.get(
   "/api/items/:id/photo",
   requireAuth,
   requireReadableSubscription,
@@ -258,6 +276,18 @@ app.put(
   requireActiveSubscription,
   requireAdminOrFounder,
   updateItemInventoryGoal
+);
+app.get(
+  "/api/items/:id/inventory/transactions",
+  requireAuth,
+  requireReadableSubscription,
+  listInventoryTransactions
+);
+app.post(
+  "/api/items/:id/inventory/transactions",
+  requireAuth,
+  requireActiveSubscription,
+  createInventoryTransaction
 );
 app.get(
   "/api/items/:id/purchase-lots",
@@ -343,6 +373,27 @@ app.delete(
   requireAuth,
   requireActiveSubscription,
   deleteRouterPhaseTemplate
+);
+
+app.get("/api/routers", requireAuth, requireReadableSubscription, listRouters);
+app.post("/api/routers", requireAuth, requireActiveSubscription, createRouter);
+app.get(
+  "/api/routers/:id",
+  requireAuth,
+  requireReadableSubscription,
+  getRouter
+);
+app.put(
+  "/api/routers/:id",
+  requireAuth,
+  requireActiveSubscription,
+  updateRouter
+);
+app.delete(
+  "/api/routers/:id",
+  requireAuth,
+  requireActiveSubscription,
+  deleteRouter
 );
 
 app.get("/api/vendors", requireAuth, requireReadableSubscription, getVendors);

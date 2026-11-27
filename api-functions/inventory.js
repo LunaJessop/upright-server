@@ -1,5 +1,6 @@
 import { pool } from "../lib/db.js";
 import { isMakeItem } from "../lib/productionTree.js";
+import { recordAbsoluteQuantity } from "../lib/inventoryTransactions.js";
 
 function stockStatus(quantity, goalMin, goalMax) {
   if (goalMin == null || goalMax == null) return null;
@@ -14,7 +15,7 @@ function stockStatus(quantity, goalMin, goalMax) {
   return "on_track";
 }
 
-async function loadItemForClient(db, itemId, clientId) {
+export async function loadInventoryItem(db, itemId, clientId) {
   const { rows } = await db.query(
     `SELECT id, make_or_buy, unit_of_measure
      FROM items
@@ -22,6 +23,18 @@ async function loadItemForClient(db, itemId, clientId) {
     [itemId, clientId]
   );
   return rows[0] ?? null;
+}
+
+export async function loadInventoryView(db, clientId, itemId) {
+  const item = await loadInventoryItem(db, itemId, clientId);
+  if (!item) return null;
+  const make = isMakeItem(item.make_or_buy);
+  const [quantity, plannedDelta, goals] = await Promise.all([
+    getCurrentQuantity(db, clientId, itemId),
+    getOpenBatchDelta(db, clientId, itemId, make),
+    getGoals(db, clientId, itemId),
+  ]);
+  return buildInventoryPayload(item, quantity, plannedDelta, goals);
 }
 
 async function getCurrentQuantity(db, clientId, itemId) {
@@ -174,19 +187,11 @@ export async function getItemInventory(req, res) {
   }
 
   try {
-    const item = await loadItemForClient(pool, itemId, clientId);
-    if (!item) {
+    const inventory = await loadInventoryView(pool, clientId, itemId);
+    if (!inventory) {
       return res.status(404).json({ error: "Item not found" });
     }
-
-    const make = isMakeItem(item.make_or_buy);
-    const [quantity, plannedDelta, goals] = await Promise.all([
-      getCurrentQuantity(pool, clientId, itemId),
-      getOpenBatchDelta(pool, clientId, itemId, make),
-      getGoals(pool, clientId, itemId),
-    ]);
-
-    res.json(buildInventoryPayload(item, quantity, plannedDelta, goals));
+    res.json(inventory);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch inventory" });
@@ -195,7 +200,7 @@ export async function getItemInventory(req, res) {
 
 export async function updateItemInventory(req, res) {
   const { id } = req.params;
-  const { clientId } = req.auth;
+  const { clientId, userId } = req.auth;
   const itemId = Number(id);
   const quantity = Number(req.body?.quantity);
 
@@ -206,31 +211,35 @@ export async function updateItemInventory(req, res) {
     return res.status(400).json({ error: "quantity must be a non-negative number" });
   }
 
+  const db = await pool.connect();
   try {
-    const item = await loadItemForClient(pool, itemId, clientId);
+    await db.query("BEGIN");
+    const item = await loadInventoryItem(db, itemId, clientId);
     if (!item) {
+      await db.query("ROLLBACK");
       return res.status(404).json({ error: "Item not found" });
     }
 
-    await pool.query(
-      `INSERT INTO inventory (client_id, item_id, quantity, updated_at)
-       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-       ON CONFLICT (client_id, item_id)
-       DO UPDATE SET quantity = EXCLUDED.quantity,
-                     updated_at = CURRENT_TIMESTAMP`,
-      [clientId, itemId, quantity]
-    );
-
-    const make = isMakeItem(item.make_or_buy);
-    const [plannedDelta, goals] = await Promise.all([
-      getOpenBatchDelta(pool, clientId, itemId, make),
-      getGoals(pool, clientId, itemId),
-    ]);
-
-    res.json(buildInventoryPayload(item, quantity, plannedDelta, goals));
+    await recordAbsoluteQuantity(db, {
+      clientId,
+      itemId,
+      quantity,
+      userId,
+      unitOfMeasure: item.unit_of_measure ?? null,
+    });
+    const inventory = await loadInventoryView(db, clientId, itemId);
+    await db.query("COMMIT");
+    res.json(inventory);
   } catch (err) {
+    try {
+      await db.query("ROLLBACK");
+    } catch {
+      // Nothing left to undo.
+    }
     console.error(err);
     res.status(500).json({ error: "Failed to update inventory" });
+  } finally {
+    db.release();
   }
 }
 
@@ -254,7 +263,7 @@ export async function updateItemInventoryGoal(req, res) {
   }
 
   try {
-    const item = await loadItemForClient(pool, itemId, clientId);
+    const item = await loadInventoryItem(pool, itemId, clientId);
     if (!item) {
       return res.status(404).json({ error: "Item not found" });
     }
